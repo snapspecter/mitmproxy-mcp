@@ -1,0 +1,17 @@
+services:
+  server:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # Ensure python output is sent straight to terminal (e.g. valid for standard docker logs)
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Mount the source code for easier development/debugging without rebuilding
+      - ./src:/app/src
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:8080/health || exit 1" ] # Note: mitmproxy might not have a /health endpoint exposed by default, but this is a placeholder or we can use a TCP check
+      interval: 30s
+      timeout: 10s
+      retries: 3
