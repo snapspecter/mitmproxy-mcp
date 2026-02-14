@@ -37,3 +37,6 @@ captured_flows.json
 # OS
 .DS_Store
 Thumbs.db
+
+# env files
+.env
