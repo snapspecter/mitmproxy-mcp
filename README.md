@@ -18,8 +18,6 @@ Standard "web search" or "fetch" tools are stateless and easily detected. mitmpr
 - **Active Interception**: Dynamic rules to inject headers, replace body content via regex, or block requests.
 - **Stealth Replay**: Re-execute flows using `curl-cffi` to impersonate modern browser TLS fingerprints (e.g., Chrome).
 
----
-
 ## Quickstart
 
 ### Option 1: Using `uvx` (Recommended)
@@ -36,8 +34,6 @@ Add this to your MCP client configuration (e.g., Claude Desktop, Cursor, or Anti
 }
 
 ```
-
----
 
 ## Installation
 
@@ -66,8 +62,6 @@ pip install mitmproxy-mcp
 
 ```
 
----
-
 ## Available Tools
 
 ### Lifecycle & Configuration
@@ -95,9 +89,7 @@ pip install mitmproxy-mcp
 
 * `replay_flow(flow_id, method, headers_json, body)`: Re-sends a request with modifications using browser-grade impersonation.
 
----
-
-## 🤖 Programmatic Usage
+## Programmatic Usage
 
 Note: These are JSON-RPC calls sent by the MCP Host (Client). You do not need to type these manually in the terminal.
 
@@ -108,15 +100,13 @@ Note: These are JSON-RPC calls sent by the MCP Host (Client). You do not need to
 3. **Modify Response**:
 `{"method": "tools/call", "params": {"name": "add_interception_rule", "arguments": {"rule_id": "mock-api", "action_type": "replace_body", "url_pattern": ".*user/profile.*", "action_value": "{\"name\": \"AI Agent\"}"}}}`
 
----
-
-## 💡 Pro-Tips
+## Helpful Tips
 
 * **Manage Context**: Use `set_scope` immediately. LLMs perform poorly when flooded with background OS telemetry.
 * **Browser Setup**: Ensure your browser or application is configured to use the proxy (usually `localhost:8080`) and has the mitmproxy CA certificates installed for HTTPS inspection.
 * **Stealth**: The `replay_flow` tool uses `curl-cffi` specifically to avoid being flagged as a bot by services that check TLS fingerprints.
 
-## 🏗 Development
+## Development
 
 ```bash
 git clone [https://github.com/snapspecter/mitmproxy-mcp.git](https://github.com/snapspecter/mitmproxy-mcp.git)
