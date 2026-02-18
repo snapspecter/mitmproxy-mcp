@@ -1,0 +1,14 @@
+{
+  "mcpVersion": "1.0",
+  "name": "mitmproxy-mcp",
+  "version": "0.1.0",
+  "description": "Advanced network interception and debugging for AI agents.",
+  "capabilities": {
+    "tools": true,
+    "resources": false
+  },
+  "appliesTo": ["local"],
+  "auth": {
+    "type": "none"
+  }
+}

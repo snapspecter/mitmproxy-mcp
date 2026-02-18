@@ -1,8 +1,11 @@
-version: "0.1.0"
+version: "1.0"
 server:
   name: "mitmproxy-mcp"
   description: "Intercept, inspect, and replay HTTPS traffic with AI agents."
   transport: stdio
+  configSchema:
+    type: object
+    properties: {}
   install:
     command: "uv"
     args: ["tool", "install", "mitmproxy-mcp"]
