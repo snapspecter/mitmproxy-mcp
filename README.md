@@ -1,78 +1,30 @@
-# Advanced mitmproxy MCP Server
+# mitmproxy MCP Server
+A Model Context Protocol (MCP) server that transforms mitmproxy into a powerful toolset for AI agents. This allows LLMs (like Claude, GPT-4, or local models) to inspect, modify, and replay HTTP/HTTPS traffic in real-time.
 
-A Model Context Protocol (MCP) server that wraps [mitmproxy](https://mitmproxy.org/) and exoses it as a tool to MCP clients. This tool allows AI assistants and GenAI tools to inspect, modify, and replay HTTP/HTTPS traffic programmatically, enabling advanced debugging, API development, and testing workflows.
+## Why use this?
+Standard "web search" or "fetch" tools are stateless and easily detected. mitmproxy-mcp provides:
 
-## Features
+* **Deep Debugging**: The agent can inspect full request/response cycles (headers, payloads, cookies) to identify why a frontend is failing or why an API is returning a `4xx/500` error.
+* **API Reverse Engineering**: Let the LLM observe undocumented internal APIs, map out JSON schemas, and generate client libraries or documentation automatically.
+* **Automated Security Testing**: Perform DAST (Dynamic Application Security Testing) by allowing the agent to inject payloads into specific parameters and analyze the response.
+* **Live Interception**: Modify traffic on the fly: inject headers, mock responses for testing, or block tracking pixels to reduce noise.
+* **Stealth Replay**: Uses `curl-cffi` to mimic Chrome/Safari TLS fingerprints, bypassing basic anti-bot measures that standard Python libraries trigger.
 
-- **Start / Stop mitmproxy**: Allows the LLM to start and stop mitmproxy as needed.
-- **Traffic Inspection**: Capture and inspect HTTP/HTTPS request and response details (headers, bodies, timing).
-- **Traffic Filtering**: Scope traffic capture to specific domains to reduce noise.
-- **Interception & Modification**: Dynamic rules to inject headers, replace body content (using regex), or block requests.
-- **Request Replay**: Re-execute captured requests with modified parameters (method, headers, body) using `curl-cffi` for stealth (impersonating a modern browser).
-- **Global Headers**: Easily set or remove global headers for all requests.
+## Key Features
 
-## Installation
+- **Lifecycle Control**: Start and stop the mitmproxy instance directly from the LLM.
+- **Deep Inspection**: Capture full request/response cycles, including headers, bodies, and timing.
+- **Precision Filtering**: Scope traffic to specific domains to keep the context window clean.
+- **Active Interception**: Dynamic rules to inject headers, replace body content via regex, or block requests.
+- **Stealth Replay**: Re-execute flows using `curl-cffi` to impersonate modern browser TLS fingerprints (e.g., Chrome).
 
-### Option 1: Using `uv` (Easy)
-Use it without installing (using uvx):
-```bash
-uvx mitmproxy-mcp
-```
+---
 
-Or install as a persistent tool:
-```bash
-uv tool install mitmproxy-mcp
-```
+## Quickstart
 
-### Option 2: Using Docker (Recommended for Isolation)
-```bash
-# Build and run with docker compose
-docker compose up -d
+### Option 1: Using `uvx` (Recommended)
+Add this to your MCP client configuration (e.g., Claude Desktop, Cursor, or AntiGravity):
 
-# Or build manually
-docker build -t mitmproxy-mcp .
-docker run -p 8080:8080 mitmproxy-mcp
-```
-
-### Option 3: Using `pip` (Make sure to use a virtualenv)
-```bash
-pip install mitmproxy-mcp
-```
-
-## Usage
-
-### Starting the Server
-Once installed, you can start the server directly:
-
-```bash
-mitmproxy-mcp
-```
-
-### Manual / Development 
-
-If you plan on making any changes to the code, or just want to run it from source, you can run it like this:
-
-### Prerequisites
-
-- [uv](https://github.com/astral-sh/uv) (for dependency management, recommended)
-
-```bash
-# Clone the repository
-git clone https://github.com/snapspecter/mitmproxy-mcp.git
-cd mitmproxy-mcp
-# Installs dependencies, creates .venv directory, etc:
-uv sync
-# Run tests
-uv run pytest
-# Run server
-uv run mitmproxy-mcp
-```
-
-### Integration with MCP Clients
-
-Add the server to your MCP client configuration (e.g., VS Code, Claude Desktop, AntiGravity).
-
-**Example Configuration (Generic):**
 ```json
 {
   "mcpServers": {
@@ -82,83 +34,100 @@ Add the server to your MCP client configuration (e.g., VS Code, Claude Desktop, 
     }
   }
 }
+
 ```
 
-If you installed it via `pip` or want to point to a specific virtualenv:
-```json
-{
-  "mcpServers": {
-    "mitmproxy-mcp": 
-      "command": "/path/to/venv/bin/mitmproxy-mcp",
-      "args": []
-    }
-  }
-}
+---
+
+## Installation
+
+### Option 1: Global Install (with `uv`)
+
+```bash
+uv tool install mitmproxy-mcp
+
 ```
+
+### Option 2: Docker (Isolated Environment)
+
+```bash
+# Build and run
+docker build -t mitmproxy-mcp .
+docker run -p 8080:8080 mitmproxy-mcp
+
+```
+
+### Option 3: Manual Pip Install
+
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install mitmproxy-mcp
+
+```
+
+---
 
 ## Available Tools
-The following tools are exposed to via the MCP server:
 
-#### Lifecycle & Configuration
-- `start_proxy(port=8080)`: Starts the mitmproxy server on the specified port.
-- `stop_proxy()`: Stops the running proxy server.
-- `set_scope(allowed_domains)`: updates the list of domains to record traffic for (e.g., `["example.com", "api.test.com"]`). Empty list records everything (subject to extension filtering).
+### Lifecycle & Configuration
 
-#### Inspection
-- `get_traffic_summary(limit=20)`: Returns a list of recent flows with basic info (ID, URL, method, status, timestamp).
-- `inspect_flow(flow_id)`: Returns full details for a specific flow, including headers and body previews. Also generates a `curl` command equivalent.
+* `start_proxy(port=8080)`: Starts the mitmproxy server.
+* `stop_proxy()`: Shuts down the proxy.
+* `set_scope(allowed_domains)`: Filters recorded traffic (e.g., `["api.github.com", "example.com"]`).
 
-#### Modification & Interception
-- `set_global_header(key, value)`: Injects a header into all requests.
-- `remove_global_header(key)`: Removes a previously set global header.
-- `add_interception_rule(rule_id, action_type, ...)`: Adds a complex rule.
-  - `action_type`: `inject_header`, `replace_body`, or `block`.
-  - `phase`: `request` or `response`.
-  - Can filter by `url_pattern` and `method`.
-- `list_rules()`: Lists active interception rules.
-- `clear_rules()`: Removes all interception rules.
+### Inspection
 
-#### Replay
-- `replay_flow(flow_id, method, headers_json, body)`: Re-sends a request based on a previous flow.
-  - Uses `curl-cffi` to mimic a Chrome browser for stealth.
-  - Useful for testing API endpoints with modified payloads or authentication.
-    
+* `get_traffic_summary(limit=20)`: Returns a list of recent network flows.
+* `inspect_flow(flow_id)`: Provides full details and a `curl` equivalent for a specific flow.
 
-> Note: Some functions (inspect/replay/detect) require captured flow IDs, which are available only after the proxy has processed traffic.
+### Modification & Interception
 
-## Quick Start
+* `add_interception_rule(rule_id, action_type, ...)`:
+* `action_type`: `inject_header`, `replace_body`, or `block`.
+* `phase`: `request` or `response`.
 
-### IDE / Chat Interface:
 
-Ask the LLM to start the mitmproxy-mcp server, then tell it add a set of rules related to the domain you are working with, it should take it from there.
+* `set_global_header(key, value)`: Injects a header into every request.
+* `clear_rules()`: Flushes all active interception rules.
 
-### Using it programatically:
+### Replay
 
-1. **Start the proxy** (defaults to port 8080):
-- `mcp_mitmproxy-mcp_start_proxy({ port: 8080 })`
-2. **Add a rule** (example: block example.com):
-- `mcp_mitmproxy-mcp_add_interception_rule({ rule_id: "block-example", action_type: "block", url_pattern: ".*example.com.*" })`
-3. **List rules** to verify:
-- `mcp_mitmproxy-mcp_list_rules()`
-4. **Set a global header** (optional):
-- `mcp_mitmproxy-mcp_set_global_header({ key: "X-Debug", value: "1" })`
-5. **Clear rules / remove headers** when done:
-- `mcp_mitmproxy-mcp_clear_rules()`
-- `mcp_mitmproxy-mcp_remove_global_header({ key: "X-Debug" })`
-6. **Stop the proxy**:
-- `mcp_mitmproxy-mcp_stop_proxy()`
+* `replay_flow(flow_id, method, headers_json, body)`: Re-sends a request with modifications using browser-grade impersonation.
 
-## Tips
+---
 
-To make it easier for the LLM to work with the data returned by the proxy, and to keep API costs down, consider following these tips:
-- Keep `rule_id` unique per rule.
-- Use `url_pattern` as a regex to target traffic; `phase` defaults to `request` if omitted.
-- Replay/inspect/detect operations need valid `flow_id` values captured by the proxy.
-- Set rules/scope, espically if you plan to do the navigating for the LLM in your default browser, as it will capture all traffic, which can be a lot.
-- If you're using port 8080 for something else, you can start the proxy on a different port using the `port` parameter.
+## 🤖 Programmatic Usage
 
-## License
-MIT
+Note: These are JSON-RPC calls sent by the MCP Host (Client). You do not need to type these manually in the terminal.
 
-## Author
-**SnapSpecter**
+1. **Initialize the Proxy**:
+`{"method": "tools/call", "params": {"name": "start_proxy", "arguments": {"port": 8080}}}`
+2. **Intercept & Block**:
+`{"method": "tools/call", "params": {"name": "add_interception_rule", "arguments": {"rule_id": "block-ads", "action_type": "block", "url_pattern": ".*analytics.*"}}}`
+3. **Modify Response**:
+`{"method": "tools/call", "params": {"name": "add_interception_rule", "arguments": {"rule_id": "mock-api", "action_type": "replace_body", "url_pattern": ".*user/profile.*", "action_value": "{\"name\": \"AI Agent\"}"}}}`
+
+---
+
+## 💡 Pro-Tips
+
+* **Manage Context**: Use `set_scope` immediately. LLMs perform poorly when flooded with background OS telemetry.
+* **Browser Setup**: Ensure your browser or application is configured to use the proxy (usually `localhost:8080`) and has the mitmproxy CA certificates installed for HTTPS inspection.
+* **Stealth**: The `replay_flow` tool uses `curl-cffi` specifically to avoid being flagged as a bot by services that check TLS fingerprints.
+
+## 🏗 Development
+
+```bash
+git clone [https://github.com/snapspecter/mitmproxy-mcp.git](https://github.com/snapspecter/mitmproxy-mcp.git)
+cd mitmproxy-mcp
+uv sync
+uv run pytest
+
+```
+
+**License:** MIT
+
+**Author:** [SnapSpecter](https://github.com/snapspecter)
+
+```
