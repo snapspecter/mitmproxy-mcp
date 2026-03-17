@@ -40,3 +40,8 @@ Thumbs.db
 
 # env files
 .env
+
+.pytest_cache/
+.vscode/
+mitm_proxy.log
+mitm_mcp_traffic.db
