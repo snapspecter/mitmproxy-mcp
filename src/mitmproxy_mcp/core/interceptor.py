@@ -13,17 +13,33 @@ class TrafficInterceptor:
 
     def __init__(self):
         self.rules: Dict[str, InterceptionRule] = {}
+        self._compiled_patterns: Dict[str, Dict[str, re.Pattern]] = {}
 
     def add_rule(self, rule: InterceptionRule):
         self.rules[rule.id] = rule
+
+        # Pre-compile regex patterns
+        patterns = {}
+        try:
+            if rule.url_pattern:
+                patterns["url"] = re.compile(rule.url_pattern)
+            if rule.search_pattern:
+                patterns["search"] = re.compile(rule.search_pattern)
+        except re.error as e:
+            logger.warning("Failed to compile regex for rule %s: %s", rule.id, e)
+
+        self._compiled_patterns[rule.id] = patterns
         logger.info("Added interception rule: %s", rule)
 
     def remove_rule(self, rule_id: str):
         if rule_id in self.rules:
             del self.rules[rule_id]
+        if rule_id in self._compiled_patterns:
+            del self._compiled_patterns[rule_id]
 
     def clear_rules(self):
         self.rules.clear()
+        self._compiled_patterns.clear()
 
     def request(self, flow: http.HTTPFlow):
         self._apply_rules(flow, "request")
@@ -42,10 +58,16 @@ class TrafficInterceptor:
 
             if rule.method and flow.request.method != rule.method:
                 continue
-            if rule.url_pattern and not re.search(
-                rule.url_pattern, flow.request.url
-            ):
-                continue
+
+            compiled = self._compiled_patterns.get(rule.id, {})
+            url_pattern = compiled.get("url")
+
+            if url_pattern:
+                if not url_pattern.search(flow.request.url):
+                    continue
+            elif rule.url_pattern:
+                if not re.search(rule.url_pattern, flow.request.url):
+                    continue
 
             try:
                 if (
@@ -67,11 +89,15 @@ class TrafficInterceptor:
                 ):
                     text = get_safe_text(message)
                     if text is not None:
-                        new_text = re.sub(
-                            rule.search_pattern,
-                            rule.value,
-                            text,
-                        )
+                        search_pattern = compiled.get("search")
+                        if search_pattern:
+                            new_text = search_pattern.sub(rule.value, text)
+                        else:
+                            new_text = re.sub(
+                                rule.search_pattern,
+                                rule.value,
+                                text,
+                            )
                         message.text = new_text
                         logger.info(
                             "Body modified by rule: '%s'",
