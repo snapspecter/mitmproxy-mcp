@@ -4,7 +4,8 @@ import sys
 import json
 from collections import Counter
 from typing import List, Dict, Any, Optional, Tuple
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode, parse_qsl
+import re
 
 import structlog
 
@@ -12,6 +13,8 @@ from mcp.server.fastmcp import FastMCP
 from mitmproxy import options
 from mitmproxy.tools.dump import DumpMaster
 from curl_cffi.requests import AsyncSession
+from jsonpath_ng import parse as parse_jsonpath
+from bs4 import BeautifulSoup
 
 from ..models import ScopeConfig, InterceptionRule
 from .scope import ScopeManager
@@ -49,6 +52,7 @@ class MitmController:
         self.interceptor = TrafficInterceptor()
         self.running = False
         self.port = 8080
+        self.session_variables = {}
 
     async def start(self, port: int = 8080, host: str = "0.0.0.0"):
         if self.running:
@@ -229,6 +233,57 @@ async def inspect_flow(flow_id: str) -> str:
 
 
 @mcp.tool()
+async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: str = None) -> str:
+    """
+    Extract specific data from a flow's response body using JSONPath or CSS Selectors.
+    Args:
+        flow_id: The ID of the captured flow
+        json_path: A JSONPath expression to extract data from a JSON response
+        css_selector: A CSS selector to extract data from an HTML/XML response
+    """
+    flow_data = controller.recorder.get_flow_detail(flow_id)
+    if not flow_data:
+        return "Couldn't find that flow."
+
+    response = flow_data.get("response")
+    if not response or not response.get("body"):
+        return "Flow has no response body to extract from."
+
+    body_content = response["body"]
+
+    if json_path:
+        try:
+            # Parse body as JSON
+            data = json.loads(body_content)
+            # Apply JSONPath
+            jsonpath_expr = parse_jsonpath(json_path)
+            matches = [match.value for match in jsonpath_expr.find(data)]
+            return json.dumps(matches, indent=2)
+        except json.JSONDecodeError:
+            return "Response body is not valid JSON."
+        except Exception as e:
+            return f"Error executing JSONPath: {str(e)}"
+
+    if css_selector:
+        try:
+            soup = BeautifulSoup(body_content, 'html.parser')
+            elements = soup.select(css_selector)
+
+            result = []
+            for el in elements:
+                result.append({
+                    "text": el.get_text(strip=True),
+                    "html": str(el),
+                    "attrs": el.attrs
+                })
+
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return f"Error executing CSS Selector: {str(e)}"
+
+    return "You must provide either a json_path or a css_selector."
+
+@mcp.tool()
 async def search_traffic(
     query: str = None,
     domain: str = None,
@@ -248,10 +303,193 @@ async def search_traffic(
 
 
 @mcp.tool()
+async def set_session_variable(name: str, value: str) -> str:
+    """Manually set a session variable to use in replayed flows."""
+    controller.session_variables[name] = value
+    return f"Set session variable ${name} = {value}"
+
+@mcp.tool()
+async def extract_session_variable(name: str, flow_id: str, regex_pattern: str, group_index: int = 1) -> str:
+    """
+    Extract a value from a flow's response body using a regex and store it as a session variable.
+    Args:
+        name: Variable name (referenced as $name in replay_flow)
+        flow_id: The ID of the flow to extract from
+        regex_pattern: The regex pattern with capture groups
+        group_index: Which regex capture group to extract (default: 1)
+    """
+    flow_data = controller.recorder.get_flow_detail(flow_id)
+    if not flow_data:
+        return "Couldn't find that flow."
+
+    response = flow_data.get("response")
+    if not response or not response.get("body"):
+        return "Flow has no response body to extract from."
+
+    try:
+        match = re.search(regex_pattern, response["body"])
+        if match:
+            value = match.group(group_index)
+            controller.session_variables[name] = value
+            return f"Extracted and set ${name} = {value}"
+        else:
+            return f"Pattern not found in response body."
+    except Exception as e:
+        return f"Error applying regex: {str(e)}"
+
+def _resolve_template(template_str: str, variables: dict) -> str:
+    """Resolves $variable placeholders in a string."""
+    result = template_str
+    for k, v in variables.items():
+        result = result.replace(f"${k}", str(v))
+    return result
+
+@mcp.tool()
 async def clear_traffic() -> str:
     """Clear all captured traffic from the database."""
     controller.recorder.clear()
     return "Cleared all traffic history."
+
+
+@mcp.tool()
+async def fuzz_endpoint(
+    flow_id: str,
+    target_param: str,
+    param_type: str,
+    payload_category: str,
+    timeout: float = 10.0,
+) -> str:
+    """
+    Fuzz an endpoint by substituting a target parameter with a category of DAST payloads.
+    Args:
+        flow_id: The flow to replay as the base request.
+        target_param: The name of the parameter to replace.
+        param_type: The location of the parameter: 'query' or 'json_body'.
+        payload_category: The category of payloads ('sqli', 'xss', 'path_traversal').
+    """
+    flow_data = controller.recorder.get_flow_detail(flow_id)
+    if not flow_data:
+        return "Couldn't find that flow."
+
+    payloads = []
+    if payload_category == "sqli":
+        payloads = ["'", "\"", "' OR '1'='1", "'; DROP TABLE users--", "1' ORDER BY 1--+"]
+    elif payload_category == "xss":
+        payloads = ["<script>alert(1)</script>", "\"><script>alert(1)</script>", "<img src=x onerror=alert(1)>"]
+    elif payload_category == "path_traversal":
+        payloads = ["../../../etc/passwd", "..%2F..%2F..%2Fetc%2Fpasswd", "/windows/win.ini"]
+    else:
+        return "Unknown payload category. Use 'sqli', 'xss', or 'path_traversal'."
+
+    original_request = flow_data["request"]
+    base_url = original_request["url"]
+    method = original_request["method"]
+
+    target_headers = dict(original_request["headers"])
+    target_headers.pop("Host", None)
+    target_headers.pop("Content-Length", None)
+    target_headers.pop("Content-Encoding", None)
+
+    # Get baseline response for anomaly detection
+    try:
+        baseline_flow = controller.recorder.db.get_flow_object(flow_id)
+        baseline_status = baseline_flow.response.status_code if baseline_flow and baseline_flow.response else 200
+        baseline_len = len(baseline_flow.response.content) if baseline_flow and baseline_flow.response and baseline_flow.response.content else 0
+    except:
+        baseline_status = 200
+        baseline_len = 0
+
+    proxy_url = f"http://127.0.0.1:{controller.port}"
+    anomalies = []
+
+    async with AsyncSession(
+        impersonate="chrome120",
+        proxies={"http": proxy_url, "https": proxy_url},
+        verify=False,
+        timeout=timeout,
+    ) as client:
+
+        tasks = []
+        for payload in payloads:
+            req_url = base_url
+            req_body = None
+
+            if param_type == "query":
+                parsed_url = urlparse(base_url)
+                qs = parse_qsl(parsed_url.query)
+                new_qs = [(k, payload if k == target_param else v) for k, v in qs]
+                # If param didn't exist, add it
+                if target_param not in [k for k, v in qs]:
+                    new_qs.append((target_param, payload))
+
+                req_url = parsed_url._replace(query=urlencode(new_qs)).geturl()
+
+                if original_request.get("body_preview"):
+                    req_body = controller.recorder.db.get_flow_object(flow_id).body
+                    if not req_body:
+                        req_body = original_request.get("body_preview")
+
+            elif param_type == "json_body":
+                body_content = controller.recorder.db.get_flow_object(flow_id).body
+                if not body_content:
+                    body_content = original_request.get("body_preview", "")
+
+                try:
+                    if isinstance(body_content, bytes):
+                        body_content = body_content.decode('utf-8')
+                    body_data = json.loads(body_content)
+                    if target_param in body_data:
+                        body_data[target_param] = payload
+                    else:
+                        # Simple nested replacement naive approach could be added here
+                        body_data[target_param] = payload
+                    req_body = json.dumps(body_data)
+                except Exception as e:
+                    return f"Failed to parse or modify JSON body: {str(e)}"
+            else:
+                return "Unknown param_type. Use 'query' or 'json_body'."
+
+            # Coroutine for the request
+            async def run_req(p=payload, u=req_url, b=req_body):
+                try:
+                    resp = await client.request(
+                        method=method,
+                        url=u,
+                        headers=target_headers,
+                        data=b if isinstance(b, str) else None,
+                        content=b if isinstance(b, bytes) else None
+                    )
+
+                    status = resp.status_code
+                    content_len = len(resp.content) if resp.content else 0
+
+                    # Anomaly detection heuristics
+                    if status >= 500:
+                        return {"payload": p, "anomaly": "Server Error (5xx)", "status": status}
+                    if status != baseline_status:
+                        return {"payload": p, "anomaly": f"Status Code Deviation ({baseline_status} -> {status})", "status": status}
+
+                    # Length deviation by > 20%
+                    if baseline_len > 0:
+                        diff_ratio = abs(content_len - baseline_len) / baseline_len
+                        if diff_ratio > 0.2:
+                            return {"payload": p, "anomaly": "Content Length Deviation (>20%)", "status": status, "len": content_len}
+                    return None
+                except Exception as e:
+                    return {"payload": p, "anomaly": f"Request Failed: {str(e)}"}
+
+            tasks.append(run_req())
+
+        # Run concurrently
+        results = await asyncio.gather(*tasks)
+        for r in results:
+            if r:
+                anomalies.append(r)
+
+    if not anomalies:
+        return "Fuzzing complete. No significant anomalies detected."
+
+    return json.dumps({"baseline_status": baseline_status, "baseline_len": baseline_len, "anomalies": anomalies}, indent=2)
 
 
 @mcp.tool()
@@ -262,10 +500,25 @@ async def replay_flow(
     body: str = None,
     timeout: float = 30.0,
 ) -> str:
+    """
+    Replay a captured flow, optionally with modified method, headers, or body.
+    Supports session variable injection (e.g., $token) in headers and body.
+    """
+
+    # Resolve templates in headers and body if we have variables
+    resolved_headers_json = headers_json
+    resolved_body = body
+
+    if controller.session_variables:
+        if resolved_headers_json:
+            resolved_headers_json = _resolve_template(resolved_headers_json, controller.session_variables)
+        if resolved_body:
+            resolved_body = _resolve_template(resolved_body, controller.session_variables)
+
     parsed_headers = None
-    if headers_json:
+    if resolved_headers_json:
         try:
-            parsed_headers = json.loads(headers_json)
+            parsed_headers = json.loads(resolved_headers_json)
         except json.JSONDecodeError:
             return "The headers_json parameter needs to be valid JSON."
 
@@ -273,7 +526,7 @@ async def replay_flow(
         flow_id,
         method,
         parsed_headers,
-        body,
+        resolved_body,
         timeout,
     )
 
@@ -390,6 +643,97 @@ def _detect_content_type(headers: Dict[str, str]) -> str:
         return "text"
     return "unknown"
 
+
+def _generate_openapi_spec(clusters: List[Dict[str, Any]], title: str = "Reconstructed API", version: str = "1.0.0") -> Dict[str, Any]:
+    """Generates an OpenAPI v3 spec from API clusters."""
+    spec = {
+        "openapi": "3.0.0",
+        "info": {
+            "title": title,
+            "version": version
+        },
+        "paths": {}
+    }
+
+    for cluster in clusters:
+        path = cluster["path_pattern"]
+        # OpenAPI paths must start with /
+        if not path.startswith("/"):
+            path = "/" + path
+
+        method = cluster["method"].lower()
+
+        if path not in spec["paths"]:
+            spec["paths"][path] = {}
+
+        operation = {
+            "summary": f"{method.upper()} {path}",
+            "parameters": [],
+            "responses": {}
+        }
+
+        # Add path params
+        for param in cluster["path_params"]:
+            operation["parameters"].append({
+                "name": param,
+                "in": "path",
+                "required": True,
+                "schema": {"type": "string"}
+            })
+
+        # Add query params
+        for param in cluster["query_params"]:
+            operation["parameters"].append({
+                "name": param,
+                "in": "query",
+                "schema": {"type": "string"} # We could guess type here, default to string
+            })
+
+        # Add headers as parameters if significant (simplified, ignoring common browser headers already handled)
+
+        # Responses
+        for status_code, count in cluster["status_codes"].items():
+            content_types = cluster["content_types"]
+            # Default response description
+            desc = f"Response with status {status_code}"
+
+            resp_obj = {"description": desc}
+
+            if content_types:
+                resp_obj["content"] = {}
+                for ct in content_types:
+                    if ct == "json":
+                        media_type = "application/json"
+                    elif ct == "xml":
+                        media_type = "application/xml"
+                    elif ct == "form":
+                        media_type = "application/x-www-form-urlencoded"
+                    else:
+                        media_type = "text/plain"
+
+                    resp_obj["content"][media_type] = {
+                        "schema": {"type": "object"} # Could be populated with inferred schema
+                    }
+
+            operation["responses"][str(status_code)] = resp_obj
+
+        spec["paths"][path][method] = operation
+
+    return spec
+
+@mcp.tool()
+async def export_openapi_spec(domain: str = None, limit: int = 50) -> str:
+    """
+    Exports captured API traffic patterns to an OpenAPI v3 JSON specification.
+    Args:
+        domain: Filter traffic by domain
+        limit: Max number of traffic flows to analyze
+    """
+    patterns_json = await get_api_patterns(domain, limit)
+    clusters = json.loads(patterns_json)
+
+    spec = _generate_openapi_spec(clusters, title=f"Reconstructed API - {domain if domain else 'All'}")
+    return json.dumps(spec, indent=2)
 
 @mcp.tool()
 async def get_api_patterns(domain: str = None, limit: int = 50) -> str:
@@ -570,6 +914,81 @@ async def detect_auth_pattern(flow_ids: str = None) -> str:
         indent=2,
     )
 
+
+@mcp.tool()
+async def generate_scraper_code(flow_ids: str, target_framework: str = "curl_cffi") -> str:
+    """
+    Generate executable scraper/automation code from a comma-separated list of flow IDs.
+    Args:
+        flow_ids: Comma-separated list of flow IDs to include in the script.
+        target_framework: The framework to generate code for (currently only 'curl_cffi' is supported).
+    """
+    ids = [fid.strip() for fid in flow_ids.split(",") if fid.strip()]
+    flows_data = []
+
+    for fid in ids:
+        data = controller.recorder.get_flow_detail(fid)
+        if data:
+            flows_data.append(data)
+
+    if not flows_data:
+        return "No valid flows found for the provided IDs."
+
+    if target_framework == "curl_cffi":
+        code = [
+            "import asyncio",
+            "import json",
+            "from curl_cffi.requests import AsyncSession",
+            "",
+            "async def run_scraper():",
+            "    # Generated by mitmproxy-mcp",
+            "    async with AsyncSession(impersonate='chrome120', verify=False) as client:",
+        ]
+
+        for i, flow in enumerate(flows_data):
+            req = flow["request"]
+            url = req["url"]
+            method = req["method"]
+
+            headers = dict(req["headers"])
+            headers.pop("Host", None)
+            headers.pop("Content-Length", None)
+            headers.pop("Content-Encoding", None)
+
+            # Fetch body if exists
+            body = req.get("body_preview")
+            flow_obj = controller.recorder.db.get_flow_object(flow["id"])
+            if flow_obj and flow_obj.request and flow_obj.request.content:
+                # We won't dump huge binaries, but try to dump text
+                try:
+                    body = flow_obj.request.content.decode('utf-8')
+                except UnicodeDecodeError:
+                    body = "<binary data omitted>"
+
+            code.append(f"        print(f'\\n[Step {i+1}] Executing {method} {url[:50]}...')")
+            code.append(f"        headers_{i} = {json.dumps(headers, indent=12).strip()}")
+
+            kwargs = f"method='{method}', url='{url}', headers=headers_{i}"
+
+            if body and body != "<binary data omitted>":
+                # Escape quotes
+                safe_body = json.dumps(body)
+                code.append(f"        data_{i} = {safe_body}")
+                kwargs += f", data=data_{i}"
+
+            code.append(f"        response_{i} = await client.request({kwargs})")
+            code.append(f"        print(f'Status: {{response_{i}.status_code}}')")
+            code.append(f"        # print(response_{i}.text[:200])")
+            code.append("")
+
+        code.extend([
+            "if __name__ == '__main__':",
+            "    asyncio.run(run_scraper())",
+        ])
+
+        return "\n".join(code)
+    else:
+        return f"Framework '{target_framework}' is not supported yet."
 
 def start():
     """Entry point for running the server directly."""
