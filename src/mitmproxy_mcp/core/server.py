@@ -148,18 +148,23 @@ class MitmController:
                 verify=False,
                 timeout=timeout,
             ) as client:
+                req_data = None
+                req_content = None
+                if isinstance(target_content, str):
+                    req_data = target_content
+                elif isinstance(target_content, bytes):
+                    req_content = target_content
+
                 response = await client.request(
                     method=target_method,
                     url=target_url,
                     headers=target_headers,
-                    data=(target_content if isinstance(target_content, str) else None),
-                    content=(target_content if isinstance(target_content, bytes) else None),
+                    data=req_data,
+                    content=req_content,
                 )
 
             return (
-                "Replayed successfully! "
-                f"(Status: {response.status_code}). "
-                "Check the traffic summary for the new flow."
+                f"Replayed successfully! (Status: {response.status_code}). Check the traffic summary for the new flow."
             )
         except Exception as e:
             logger.error(f"Replay failed: {e}")
@@ -238,7 +243,8 @@ async def inspect_flow(flow_id: str) -> str:
 @mcp.tool()
 async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: str = None) -> str:
     """
-    Extract specific data from a flow's response body using JSONPath or CSS Selectors.
+    Extract specific data from a flow's response body using JSONPath or CSS
+    selectors.
     Args:
         flow_id: The ID of the captured flow
         json_path: A JSONPath expression to extract data from a JSON response
@@ -266,25 +272,22 @@ async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: s
             return "Response body is not valid JSON."
         except Exception as e:
             return f"Error executing JSONPath: {str(e)}"
-    
+
     if css_selector:
         try:
-            soup = BeautifulSoup(body_content, 'html.parser')
+            soup = BeautifulSoup(body_content, "html.parser")
             elements = soup.select(css_selector)
-            
+
             result = []
             for el in elements:
-                result.append({
-                    "text": el.get_text(strip=True),
-                    "html": str(el),
-                    "attrs": el.attrs
-                })
-                
+                result.append({"text": el.get_text(strip=True), "html": str(el), "attrs": el.attrs})
+
             return json.dumps(result, indent=2)
         except Exception as e:
             return f"Error executing CSS Selector: {str(e)}"
 
     return "You must provide a json_path or a css_selector."
+
 
 @mcp.tool()
 async def search_traffic(
@@ -310,6 +313,7 @@ async def set_session_variable(name: str, value: str) -> str:
     """Manually set a session variable to use in replayed flows."""
     controller.session_variables[name] = value
     return f"Set session variable ${name} = {value}"
+
 
 @mcp.tool()
 async def extract_session_variable(name: str, flow_id: str, regex_pattern: str, group_index: int = 1) -> str:
@@ -339,12 +343,14 @@ async def extract_session_variable(name: str, flow_id: str, regex_pattern: str, 
     except Exception as e:
         return f"Error applying regex: {str(e)}"
 
+
 def _resolve_template(template_str: str, variables: dict) -> str:
     """Resolves $variable placeholders in a string."""
     result = template_str
     for k, v in variables.items():
         result = result.replace(f"${k}", str(v))
     return result
+
 
 @mcp.tool()
 async def clear_traffic() -> str:
@@ -362,24 +368,39 @@ async def fuzz_endpoint(
     timeout: float = 10.0,
 ) -> str:
     """
-    Fuzz an endpoint by substituting a target parameter with a category of DAST payloads.
+    Fuzz an endpoint by substituting a target parameter with a category of
+    DAST payloads.
     Args:
         flow_id: The flow to replay as the base request.
         target_param: The name of the parameter to replace.
         param_type: The location of the parameter: 'query' or 'json_body'.
-        payload_category: The category of payloads ('sqli', 'xss', 'path_traversal').
+        payload_category: The category of payloads
+        ('sqli', 'xss', 'path_traversal').
     """
     flow_data = controller.recorder.get_flow_detail(flow_id)
     if not flow_data:
         return "No matching flow."
 
-    payloads = []
     if payload_category == "sqli":
-        payloads = ["'", "\"", "' OR '1'='1", "'; DROP TABLE users--", "1' ORDER BY 1--+"]
+        payloads = [
+            "'",
+            '"',
+            "' OR '1'='1",
+            "'; DROP TABLE users--",
+            "1' ORDER BY 1--+",
+        ]
     elif payload_category == "xss":
-        payloads = ["<script>alert(1)</script>", "\"><script>alert(1)</script>", "<img src=x onerror=alert(1)>"]
+        payloads = [
+            "<script>alert(1)</script>",
+            '"><script>alert(1)</script>',
+            "<img src=x onerror=alert(1)>",
+        ]
     elif payload_category == "path_traversal":
-        payloads = ["../../../etc/passwd", "..%2F..%2F..%2Fetc%2Fpasswd", "/windows/win.ini"]
+        payloads = [
+            "../../../etc/passwd",
+            "..%2F..%2F..%2Fetc%2Fpasswd",
+            "/windows/win.ini",
+        ]
     else:
         return "Unknown payload category. Use 'sqli', 'xss', or 'path_traversal'."
 
@@ -395,9 +416,16 @@ async def fuzz_endpoint(
     # Get baseline response for anomaly detection
     try:
         baseline_flow = controller.recorder.db.get_flow_object(flow_id)
-        baseline_status = baseline_flow.response.status_code if baseline_flow and baseline_flow.response else 200
-        baseline_len = len(baseline_flow.response.content) if baseline_flow and baseline_flow.response and baseline_flow.response.content else 0
-    except:
+        if baseline_flow and baseline_flow.response:
+            baseline_status = baseline_flow.response.status_code
+        else:
+            baseline_status = 200
+
+        if baseline_flow and baseline_flow.response and baseline_flow.response.content:
+            baseline_len = len(baseline_flow.response.content)
+        else:
+            baseline_len = 0
+    except Exception:
         baseline_status = 200
         baseline_len = 0
 
@@ -410,12 +438,11 @@ async def fuzz_endpoint(
         verify=False,
         timeout=timeout,
     ) as client:
-        
         tasks = []
         for payload in payloads:
             req_url = base_url
             req_body = None
-            
+
             if param_type == "query":
                 parsed_url = urlparse(base_url)
                 qs = parse_qsl(parsed_url.query)
@@ -423,22 +450,24 @@ async def fuzz_endpoint(
                 # If param didn't exist, add it
                 if target_param not in [k for k, v in qs]:
                     new_qs.append((target_param, payload))
-                
+
                 req_url = parsed_url._replace(query=urlencode(new_qs)).geturl()
-                
+
                 if original_request.get("body_preview"):
-                    req_body = controller.recorder.db.get_flow_object(flow_id).body
+                    flow_obj = controller.recorder.db.get_flow_object(flow_id)
+                    req_body = flow_obj.body
                     if not req_body:
                         req_body = original_request.get("body_preview")
 
             elif param_type == "json_body":
-                body_content = controller.recorder.db.get_flow_object(flow_id).body
+                flow_obj = controller.recorder.db.get_flow_object(flow_id)
+                body_content = flow_obj.body
                 if not body_content:
                     body_content = original_request.get("body_preview", "")
-                
+
                 try:
                     if isinstance(body_content, bytes):
-                        body_content = body_content.decode('utf-8')
+                        body_content = body_content.decode("utf-8")
                     body_data = json.loads(body_content)
                     if target_param in body_data:
                         body_data[target_param] = payload
@@ -459,27 +488,43 @@ async def fuzz_endpoint(
                         url=u,
                         headers=target_headers,
                         data=b if isinstance(b, str) else None,
-                        content=b if isinstance(b, bytes) else None
+                        content=b if isinstance(b, bytes) else None,
                     )
-                    
+
                     status = resp.status_code
                     content_len = len(resp.content) if resp.content else 0
-                    
+
                     # Anomaly detection heuristics
                     if status >= 500:
-                        return {"payload": p, "anomaly": "Server Error (5xx)", "status": status}
+                        return {
+                            "payload": p,
+                            "anomaly": "Server Error (5xx)",
+                            "status": status,
+                        }
                     if status != baseline_status:
-                        return {"payload": p, "anomaly": f"Status Code Deviation ({baseline_status} -> {status})", "status": status}
-                    
+                        return {
+                            "payload": p,
+                            "anomaly": (f"Status Code Deviation ({baseline_status} -> {status})"),
+                            "status": status,
+                        }
+
                     # Length deviation by > 20%
                     if baseline_len > 0:
                         diff_ratio = abs(content_len - baseline_len) / baseline_len
                         if diff_ratio > 0.2:
-                            return {"payload": p, "anomaly": "Content Length Deviation (>20%)", "status": status, "len": content_len}
+                            return {
+                                "payload": p,
+                                "anomaly": "Content Length Deviation (>20%)",
+                                "status": status,
+                                "len": content_len,
+                            }
                     return None
                 except Exception as e:
-                    return {"payload": p, "anomaly": f"Request Failed: {str(e)}"}
-            
+                    return {
+                        "payload": p,
+                        "anomaly": f"Request Failed: {str(e)}",
+                    }
+
             tasks.append(run_req())
 
         # Run concurrently
@@ -490,8 +535,15 @@ async def fuzz_endpoint(
 
     if not anomalies:
         return "Fuzzing complete, No significant anomalies detected."
-    
-    return json.dumps({"baseline_status": baseline_status, "baseline_len": baseline_len, "anomalies": anomalies}, indent=2)
+
+    return json.dumps(
+        {
+            "baseline_status": baseline_status,
+            "baseline_len": baseline_len,
+            "anomalies": anomalies,
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -506,11 +558,11 @@ async def replay_flow(
     Replay a captured flow, optionally with modified method, headers, or body.
     Supports session variable injection (e.g., $token) in headers and body.
     """
-    
+
     # Resolve templates in headers and body if we have variables
     resolved_headers_json = headers_json
     resolved_body = body
-    
+
     if controller.session_variables:
         if resolved_headers_json:
             resolved_headers_json = _resolve_template(resolved_headers_json, controller.session_variables)
@@ -590,9 +642,7 @@ async def list_tools() -> str:
     tools = await mcp.list_tools()
     tool_list = []
     for tool in tools:
-        tool_list.append(
-            {"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema}
-        )
+        tool_list.append({"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema})
     return json.dumps(tool_list, indent=2)
 
 
@@ -633,7 +683,7 @@ def _normalize_path(path: str) -> Tuple[str, List[str]]:
     return "/".join(normalized), params
 
 
-def _detect_content_type(headers: Dict[str, str]) -> str:
+def _detect_content_type(headers: Dict[str, Any]) -> str:
     ct = headers.get("content-type", headers.get("Content-Type", ""))
     if "json" in ct.lower():
         return "json"
@@ -646,15 +696,16 @@ def _detect_content_type(headers: Dict[str, str]) -> str:
     return "unknown"
 
 
-def _generate_openapi_spec(clusters: List[Dict[str, Any]], title: str = "Reconstructed API", version: str = "1.0.0") -> Dict[str, Any]:
+def _generate_openapi_spec(
+    clusters: List[Dict[str, Any]],
+    title: str = "Reconstructed API",
+    version: str = "1.0.0",
+) -> Dict[str, Any]:
     """Reconstructs an OpenAPI v3 spec from API clusters."""
     spec = {
         "openapi": "3.0.0",
-        "info": {
-            "title": title,
-            "version": version
-        },
-        "paths": {}
+        "info": {"title": title, "version": version},
+        "paths": {},
     }
 
     for cluster in clusters:
@@ -662,45 +713,47 @@ def _generate_openapi_spec(clusters: List[Dict[str, Any]], title: str = "Reconst
         # OpenAPI paths must start with /
         if not path.startswith("/"):
             path = "/" + path
-            
+
         method = cluster["method"].lower()
-        
+
         if path not in spec["paths"]:
             spec["paths"][path] = {}
-            
+
         operation = {
             "summary": f"{method.upper()} {path}",
             "parameters": [],
-            "responses": {}
+            "responses": {},
         }
-        
+
         # Add path params
         for param in cluster["path_params"]:
             operation["parameters"].append({
                 "name": param,
                 "in": "path",
                 "required": True,
-                "schema": {"type": "string"}
+                "schema": {"type": "string"},
             })
-            
+
         # Add query params
         for param in cluster["query_params"]:
             operation["parameters"].append({
                 "name": param,
                 "in": "query",
-                "schema": {"type": "string"} # We could guess type here, default to string
+                # We could guess type here, default to string
+                "schema": {"type": "string"},
             })
-            
-        # Add headers as parameters if significant (simplified, ignoring common browser headers already handled)
-        
+
+        # Add headers as parameters if significant
+        # (simplified, ignoring common browser headers already handled)
+
         # Responses
         for status_code, count in cluster["status_codes"].items():
             content_types = cluster["content_types"]
             # Default response description
             desc = f"Response with status {status_code}"
-            
+
             resp_obj = {"description": desc}
-            
+
             if content_types:
                 resp_obj["content"] = {}
                 for ct in content_types:
@@ -712,16 +765,16 @@ def _generate_openapi_spec(clusters: List[Dict[str, Any]], title: str = "Reconst
                         media_type = "application/x-www-form-urlencoded"
                     else:
                         media_type = "text/plain"
-                        
-                    resp_obj["content"][media_type] = {
-                        "schema": {"type": "object"} # Could be populated with inferred schema
-                    }
-                    
+
+                    # Could be populated with inferred schema
+                    resp_obj["content"][media_type] = {"schema": {"type": "object"}}
+
             operation["responses"][str(status_code)] = resp_obj
-            
+
         spec["paths"][path][method] = operation
-        
+
     return spec
+
 
 @mcp.tool()
 async def export_openapi_spec(domain: str = None, limit: int = 50) -> str:
@@ -733,9 +786,13 @@ async def export_openapi_spec(domain: str = None, limit: int = 50) -> str:
     """
     patterns_json = await get_api_patterns(domain, limit)
     clusters = json.loads(patterns_json)
-    
-    spec = _generate_openapi_spec(clusters, title=f"Reconstructed API - {domain if domain else 'All'}")
+
+    spec = _generate_openapi_spec(
+        clusters,
+        title=f"Reconstructed API - {domain if domain else 'All'}",
+    )
     return json.dumps(spec, indent=2)
+
 
 @mcp.tool()
 async def get_api_patterns(domain: str = None, limit: int = 50) -> str:
@@ -797,20 +854,18 @@ async def get_api_patterns(domain: str = None, limit: int = 50) -> str:
 
     result = []
     for key, cluster in sorted(endpoint_clusters.items(), key=lambda x: -x[1]["count"]):
-        result.append(
-            {
-                "endpoint": key,
-                "method": cluster["method"],
-                "path_pattern": cluster["path_pattern"],
-                "path_params": cluster["path_params"],
-                "query_params": list(cluster["query_params"]),
-                "common_headers": dict(cluster["request_headers"].most_common(10)),
-                "status_codes": dict(cluster["response_status_codes"]),
-                "content_types": dict(cluster["content_types"]),
-                "request_count": cluster["count"],
-                "sample_flow_ids": cluster["sample_flow_ids"][:3],
-            }
-        )
+        result.append({
+            "endpoint": key,
+            "method": cluster["method"],
+            "path_pattern": cluster["path_pattern"],
+            "path_params": cluster["path_params"],
+            "query_params": list(cluster["query_params"]),
+            "common_headers": dict(cluster["request_headers"].most_common(10)),
+            "status_codes": dict(cluster["response_status_codes"]),
+            "content_types": dict(cluster["content_types"]),
+            "request_count": cluster["count"],
+            "sample_flow_ids": cluster["sample_flow_ids"][:3],
+        })
 
     return json.dumps(result, indent=2)
 
@@ -920,20 +975,21 @@ async def detect_auth_pattern(flow_ids: str = None) -> str:
 @mcp.tool()
 async def generate_scraper_code(flow_ids: str, target_framework: str = "curl_cffi") -> str:
     """
-    Generate executable scraper/automation code from a comma-separated list of flow IDs.
+    Generate executable scraper/automation code from a comma-separated list of
+    flow IDs.
     Args:
         flow_ids: Comma-separated list of flow IDs to include in the script.
-        target_framework: The framework to generate code for (TODO: Add additional 
-        frameworks: Only 'curl_cffi' is currently supported).
+        target_framework: The framework to generate code for (TODO: Add
+        additional frameworks: Only 'curl_cffi' is currently supported).
     """
     ids = [fid.strip() for fid in flow_ids.split(",") if fid.strip()]
     flows_data = []
-    
+
     for fid in ids:
         data = controller.recorder.get_flow_detail(fid)
         if data:
             flows_data.append(data)
-            
+
     if not flows_data:
         return "No valid flows found for the provided IDs."
 
@@ -945,53 +1001,67 @@ async def generate_scraper_code(flow_ids: str, target_framework: str = "curl_cff
             "",
             "async def run_scraper():",
             "    # Generated by mitmproxy-mcp",
-            "    async with AsyncSession(impersonate='chrome120', verify=False) as client:",
+            "    async with AsyncSession(",
+            "        impersonate='chrome120', verify=False",
+            "    ) as client:",
         ]
-        
+
         for i, flow in enumerate(flows_data):
             req = flow["request"]
             url = req["url"]
             method = req["method"]
-            
+
             headers = dict(req["headers"])
             headers.pop("Host", None)
             headers.pop("Content-Length", None)
             headers.pop("Content-Encoding", None)
-            
-            # Fetch body if exists
-            body = req.get("body_preview")
-            flow_obj = controller.recorder.db.get_flow_object(flow["id"])
-            if flow_obj and flow_obj.request and flow_obj.request.content:
-                # We won't dump huge binaries, but try to dump text
-                try:
-                    body = flow_obj.request.content.decode('utf-8')
-                except UnicodeDecodeError:
-                    body = "<binary data omitted>"
 
-            code.append(f"        print(f'\\n[Step {i+1}] Executing {method} {url[:50]}...')")
-            code.append(f"        headers_{i} = {json.dumps(headers, indent=12).strip()}")
-            
+            # Prefer richer in-memory flow object when available,
+            # then DB fallback.
+            body = req.get("body_preview")
+
+            live_flow = controller.recorder.get_live_flow(flow["id"])
+            if live_flow and live_flow.request and live_flow.request.content:
+                try:
+                    body = live_flow.request.content.decode("utf-8")
+                except UnicodeDecodeError:
+                    body = body or "<binary data omitted>"
+            else:
+                flow_obj = controller.recorder.db.get_flow_object(flow["id"])
+                if flow_obj and flow_obj.body:
+                    body = flow_obj.body
+
+            step_line = f"        print(f'\\n[Step {i + 1}] Executing {method} {url[:50]}...')"
+            code.append(step_line)
+
+            headers_str = json.dumps(headers, indent=12).strip()
+            # Indent subsequent lines
+            headers_str = headers_str.replace("\n", "\n        ")
+
+            code.append(f"        headers_{i} = {headers_str}")
+
             kwargs = f"method='{method}', url='{url}', headers=headers_{i}"
-            
+
             if body and body != "<binary data omitted>":
                 # Escape quotes
                 safe_body = json.dumps(body)
                 code.append(f"        data_{i} = {safe_body}")
                 kwargs += f", data=data_{i}"
-                
+
             code.append(f"        response_{i} = await client.request({kwargs})")
             code.append(f"        print(f'Status: {{response_{i}.status_code}}')")
             code.append(f"        # print(response_{i}.text[:200])")
             code.append("")
-            
+
         code.extend([
             "if __name__ == '__main__':",
             "    asyncio.run(run_scraper())",
         ])
-        
+
         return "\n".join(code)
     else:
         return f"Framework '{target_framework}' is not supported yet."
+
 
 def start():
     """Entry point for running the server directly."""

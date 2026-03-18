@@ -176,9 +176,7 @@ class TrafficDB:
                     "method": simple_request.method,
                     "url": simple_request.url,
                     "headers": simple_request.headers,
-                    "body_preview": (
-                        simple_request.body[:2000] if simple_request.body else None
-                    ),
+                    "body_preview": (simple_request.body[:2000] if simple_request.body else None),
                 },
                 "response": {
                     "status_code": simple_response.status_code,
@@ -333,6 +331,13 @@ class TrafficRecorder:
 
     def get_flow_detail(self, flow_id: str) -> Optional[Dict[str, Any]]:
         return self.db.get_detail(flow_id)
+
+    def get_live_flow(self, flow_id: str) -> Optional[http.HTTPFlow]:
+        """Return a richer in-memory HTTPFlow when it is still buffered."""
+        for flow in reversed(self.flows):
+            if flow.id == flow_id:
+                return flow
+        return None
 
     def search(self, query: str, domain: str, method: str, limit: int):
         return self.db.search(query, domain, method, limit)
