@@ -54,7 +54,7 @@ class MitmController:
         self.port = 8080
         self.session_variables = {}
 
-    async def start(self, port: int = 8080, host: str = "0.0.0.0"):
+    async def start(self, port: int = 8080, host: str = "127.0.0.1"):
         if self.running:
             return "MITM is already running."
 
