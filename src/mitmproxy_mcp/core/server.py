@@ -1031,7 +1031,10 @@ async def generate_scraper_code(flow_ids: str, target_framework: str = "curl_cff
                 if flow_obj and flow_obj.body:
                     body = flow_obj.body
 
-            step_line = f"        print(f'\\n[Step {i + 1}] Executing {method} {url[:50]}...')"
+            safe_method = json.dumps(method)
+            safe_url = json.dumps(url)
+            safe_url_preview = json.dumps(url[:50])
+            step_line = f"        print(f'\\n[Step {i + 1}] Executing ' + {safe_method} + ' ' + {safe_url_preview} + '...')"
             code.append(step_line)
 
             headers_str = json.dumps(headers, indent=12).strip()
@@ -1040,7 +1043,7 @@ async def generate_scraper_code(flow_ids: str, target_framework: str = "curl_cff
 
             code.append(f"        headers_{i} = {headers_str}")
 
-            kwargs = f"method='{method}', url='{url}', headers=headers_{i}"
+            kwargs = f"method={safe_method}, url={safe_url}, headers=headers_{i}"
 
             if body and body != "<binary data omitted>":
                 # Escape quotes
