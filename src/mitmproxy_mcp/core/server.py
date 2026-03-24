@@ -163,9 +163,7 @@ class MitmController:
                     content=req_content,
                 )
 
-            return (
-                f"Replayed successfully! (Status: {response.status_code}). Check the traffic summary for the new flow."
-            )
+            return f"Replayed successfully! (Status: {response.status_code}). Check the traffic summary for the new flow."
         except Exception as e:
             logger.error(f"Replay failed: {e}")
             return f"That didn't work: {str(e)}"
@@ -316,7 +314,9 @@ async def set_session_variable(name: str, value: str) -> str:
 
 
 @mcp.tool()
-async def extract_session_variable(name: str, flow_id: str, regex_pattern: str, group_index: int = 1) -> str:
+async def extract_session_variable(
+    name: str, flow_id: str, regex_pattern: str, group_index: int = 1
+) -> str:
     """
     Extract a value from a flow's response body using a regex and store it as a session variable.
     Args:
@@ -565,7 +565,9 @@ async def replay_flow(
 
     if controller.session_variables:
         if resolved_headers_json:
-            resolved_headers_json = _resolve_template(resolved_headers_json, controller.session_variables)
+            resolved_headers_json = _resolve_template(
+                resolved_headers_json, controller.session_variables
+            )
         if resolved_body:
             resolved_body = _resolve_template(resolved_body, controller.session_variables)
 
@@ -642,7 +644,9 @@ async def list_tools() -> str:
     tools = await mcp.list_tools()
     tool_list = []
     for tool in tools:
-        tool_list.append({"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema})
+        tool_list.append(
+            {"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema}
+        )
     return json.dumps(tool_list, indent=2)
 
 
@@ -727,21 +731,25 @@ def _generate_openapi_spec(
 
         # Add path params
         for param in cluster["path_params"]:
-            operation["parameters"].append({
-                "name": param,
-                "in": "path",
-                "required": True,
-                "schema": {"type": "string"},
-            })
+            operation["parameters"].append(
+                {
+                    "name": param,
+                    "in": "path",
+                    "required": True,
+                    "schema": {"type": "string"},
+                }
+            )
 
         # Add query params
         for param in cluster["query_params"]:
-            operation["parameters"].append({
-                "name": param,
-                "in": "query",
-                # We could guess type here, default to string
-                "schema": {"type": "string"},
-            })
+            operation["parameters"].append(
+                {
+                    "name": param,
+                    "in": "query",
+                    # We could guess type here, default to string
+                    "schema": {"type": "string"},
+                }
+            )
 
         # Add headers as parameters if significant
         # (simplified, ignoring common browser headers already handled)
@@ -854,18 +862,20 @@ async def get_api_patterns(domain: str = None, limit: int = 50) -> str:
 
     result = []
     for key, cluster in sorted(endpoint_clusters.items(), key=lambda x: -x[1]["count"]):
-        result.append({
-            "endpoint": key,
-            "method": cluster["method"],
-            "path_pattern": cluster["path_pattern"],
-            "path_params": cluster["path_params"],
-            "query_params": list(cluster["query_params"]),
-            "common_headers": dict(cluster["request_headers"].most_common(10)),
-            "status_codes": dict(cluster["response_status_codes"]),
-            "content_types": dict(cluster["content_types"]),
-            "request_count": cluster["count"],
-            "sample_flow_ids": cluster["sample_flow_ids"][:3],
-        })
+        result.append(
+            {
+                "endpoint": key,
+                "method": cluster["method"],
+                "path_pattern": cluster["path_pattern"],
+                "path_params": cluster["path_params"],
+                "query_params": list(cluster["query_params"]),
+                "common_headers": dict(cluster["request_headers"].most_common(10)),
+                "status_codes": dict(cluster["response_status_codes"]),
+                "content_types": dict(cluster["content_types"]),
+                "request_count": cluster["count"],
+                "sample_flow_ids": cluster["sample_flow_ids"][:3],
+            }
+        )
 
     return json.dumps(result, indent=2)
 
@@ -873,12 +883,8 @@ async def get_api_patterns(domain: str = None, limit: int = 50) -> str:
 @mcp.tool()
 async def detect_auth_pattern(flow_ids: str = None) -> str:
     if flow_ids:
-        # This is inefficient, fetching all then filtering.
-        # Ideally get_all_for_analysis filters.
-        # But for now it's okay.
-        flows = controller.recorder.get_all_for_analysis()
-        target_ids = set(flow_ids.split(","))
-        flows = [f for f in flows if f["id"] in target_ids]
+        target_ids = [fid.strip() for fid in flow_ids.split(",") if fid.strip()]
+        flows = controller.recorder.get_by_ids(target_ids)
     else:
         flows = controller.recorder.get_all_for_analysis()
 
@@ -1053,10 +1059,12 @@ async def generate_scraper_code(flow_ids: str, target_framework: str = "curl_cff
             code.append(f"        # print(response_{i}.text[:200])")
             code.append("")
 
-        code.extend([
-            "if __name__ == '__main__':",
-            "    asyncio.run(run_scraper())",
-        ])
+        code.extend(
+            [
+                "if __name__ == '__main__':",
+                "    asyncio.run(run_scraper())",
+            ]
+        )
 
         return "\n".join(code)
     else:
