@@ -131,15 +131,17 @@ class TrafficDB:
                         headers.get("Content-Type", "unknown"),
                     )
 
-                result.append({
-                    "id": row["id"],
-                    "url": row["url"],
-                    "method": row["method"],
-                    "status_code": row["status_code"],
-                    "content_type": content_type,
-                    "size": row["size"],
-                    "timestamp": row["timestamp"],
-                })
+                result.append(
+                    {
+                        "id": row["id"],
+                        "url": row["url"],
+                        "method": row["method"],
+                        "status_code": row["status_code"],
+                        "content_type": content_type,
+                        "size": row["size"],
+                        "timestamp": row["timestamp"],
+                    }
+                )
             return result
 
     def get_detail(self, flow_id: str) -> Optional[Dict[str, Any]]:
@@ -226,22 +228,61 @@ class TrafficDB:
             rows = cursor.fetchall()
             results = []
             for row in rows:
-                results.append({
-                    "id": row["id"],
-                    "request": {
-                        "url": row["url"],
-                        "method": row["method"],
-                        "headers": json.loads(row["request_headers"]),
-                        "body": row["request_body"],
-                    },
-                    "response": {
-                        "status_code": row["status_code"],
-                        "headers": json.loads(row["response_headers"]) if row["response_headers"] else {},
-                        "body": row["response_body"],
+                results.append(
+                    {
+                        "id": row["id"],
+                        "request": {
+                            "url": row["url"],
+                            "method": row["method"],
+                            "headers": json.loads(row["request_headers"]),
+                            "body": row["request_body"],
+                        },
+                        "response": {
+                            "status_code": row["status_code"],
+                            "headers": json.loads(row["response_headers"])
+                            if row["response_headers"]
+                            else {},
+                            "body": row["response_body"],
+                        }
+                        if row["status_code"]
+                        else None,
                     }
-                    if row["status_code"]
-                    else None,
-                })
+                )
+            return results
+
+    def get_by_ids(self, flow_ids: List[str]) -> List[Dict[str, Any]]:
+        if not flow_ids:
+            return []
+        placeholders = ",".join(["?"] * len(flow_ids))
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                f"SELECT * FROM flows WHERE id IN ({placeholders})",
+                flow_ids,
+            )
+            rows = cursor.fetchall()
+            results = []
+            for row in rows:
+                results.append(
+                    {
+                        "id": row["id"],
+                        "request": {
+                            "url": row["url"],
+                            "method": row["method"],
+                            "headers": json.loads(row["request_headers"]),
+                            "body": row["request_body"],
+                        },
+                        "response": {
+                            "status_code": row["status_code"],
+                            "headers": json.loads(row["response_headers"])
+                            if row["response_headers"]
+                            else {},
+                            "body": row["response_body"],
+                        }
+                        if row["status_code"]
+                        else None,
+                    }
+                )
             return results
 
     def _generate_curl(self, request: SimpleRequest) -> str:
