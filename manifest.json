@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.2",
   "name": "mitmproxy-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Intercept, inspect, and replay HTTPS traffic with AI agents.",
   "long_description": "MCP Server that wraps mitmproxy and exposes it as a tool to any MCP client, allows your AI agents to inspect traffic, filter traffic, intercept & modify traffic, request reply, set global headers, and start/stop mitmproxy as needed.",
   "author": {

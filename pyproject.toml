@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mitmproxy-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MITM proxy manager with MCP integration"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -32,6 +32,7 @@ dependencies = [
     "structlog>=24.1.0",
     "jsonpath-ng>=1.8.0",
     "beautifulsoup4>=4.14.3",
+    "playwright>=1.58.0",
 ]
 
 [project.urls]
