@@ -49,7 +49,28 @@ Add this to your MCP client configuration (e.g., Claude Desktop, Cursor, or Anti
     }
   }
 }
+```
 
+### Option 2: From a Cloned Repository
+
+If you want to run from a local clone (useful for development or testing unreleased changes):
+
+```bash
+git clone https://github.com/snapspecter/mitmproxy-mcp.git
+```
+
+Then add this to your MCP client configuration, replacing the path with your clone location:
+
+```json
+{
+  "mcpServers": {
+    "mitmproxy-mcp": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/mitmproxy-mcp", "mitmproxy-mcp"]
+    }
+  }
+}
 ```
 
 ## Installation
