@@ -11,6 +11,20 @@ from .scope import ScopeManager
 from .utils import get_safe_text
 
 
+def _parse_headers(raw: str) -> Dict[str, str]:
+    """Parse stored headers into a dict for backward compat.
+
+    Headers are stored as either:
+    - list of [key, value] pairs (new format, preserves order)
+    - dict (legacy format)
+    Returns a dict in both cases. Duplicate keys are collapsed (last wins).
+    """
+    parsed = json.loads(raw)
+    if isinstance(parsed, list):
+        return {k: v for k, v in parsed}
+    return parsed
+
+
 class SimpleRequest:
     def __init__(self, method: str, url: str, headers: Dict[str, str], body: Optional[str]):
         self.method = method
@@ -93,9 +107,21 @@ class TrafficDB:
                     flow.request.url,
                     flow.request.method,
                     status_code,
-                    json.dumps(dict(flow.request.headers)),
+                    json.dumps(
+                        [
+                            [k.decode("latin-1"), v.decode("latin-1")]
+                            for k, v in flow.request.headers.fields
+                        ],
+                    ),
                     req_body,
-                    json.dumps(dict(flow.response.headers)) if flow.response else None,
+                    json.dumps(
+                        [
+                            [k.decode("latin-1"), v.decode("latin-1")]
+                            for k, v in flow.response.headers.fields
+                        ],
+                    )
+                    if flow.response
+                    else None,
                     resp_body,
                     flow.request.timestamp_start,
                     size,
@@ -125,7 +151,7 @@ class TrafficDB:
             for row in rows:
                 content_type = "unknown"
                 if row["response_headers"]:
-                    headers = json.loads(row["response_headers"])
+                    headers = _parse_headers(row["response_headers"])
                     content_type = headers.get(
                         "content-type",
                         headers.get("Content-Type", "unknown"),
@@ -153,8 +179,8 @@ class TrafficDB:
             if not row:
                 return None
 
-            req_headers = json.loads(row["request_headers"])
-            resp_headers = json.loads(row["response_headers"]) if row["response_headers"] else None
+            req_headers = _parse_headers(row["request_headers"])
+            resp_headers = _parse_headers(row["response_headers"]) if row["response_headers"] else None
 
             simple_request = SimpleRequest(
                 method=row["method"],
@@ -234,12 +260,12 @@ class TrafficDB:
                         "request": {
                             "url": row["url"],
                             "method": row["method"],
-                            "headers": json.loads(row["request_headers"]),
+                            "headers": _parse_headers(row["request_headers"]),
                             "body": row["request_body"],
                         },
                         "response": {
                             "status_code": row["status_code"],
-                            "headers": json.loads(row["response_headers"])
+                            "headers": _parse_headers(row["response_headers"])
                             if row["response_headers"]
                             else {},
                             "body": row["response_body"],
@@ -269,12 +295,12 @@ class TrafficDB:
                         "request": {
                             "url": row["url"],
                             "method": row["method"],
-                            "headers": json.loads(row["request_headers"]),
+                            "headers": _parse_headers(row["request_headers"]),
                             "body": row["request_body"],
                         },
                         "response": {
                             "status_code": row["status_code"],
-                            "headers": json.loads(row["response_headers"])
+                            "headers": _parse_headers(row["response_headers"])
                             if row["response_headers"]
                             else {},
                             "body": row["response_body"],
@@ -315,7 +341,7 @@ class TrafficDB:
             if not row:
                 return None
 
-            headers = json.loads(row["request_headers"])
+            headers = _parse_headers(row["request_headers"])
             return SimpleRequest(
                 method=row["method"],
                 url=row["url"],
