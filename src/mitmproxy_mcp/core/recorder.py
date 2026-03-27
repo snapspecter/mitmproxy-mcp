@@ -2,10 +2,12 @@ import json
 import shlex
 import sqlite3
 import sys
-from collections import deque  # added
+from collections import deque
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from mitmproxy import http
+from mitmproxy.io import FlowReader
 
 from .scope import ScopeManager
 from .utils import get_safe_text
@@ -284,6 +286,55 @@ class TrafficDB:
                     }
                 )
             return results
+
+    def import_from_file(
+        self,
+        file_path: str,
+        append: bool = False,
+        scope: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Import flows from a HAR or mitmproxy flow file.
+
+        Uses mitmproxy's FlowReader which auto-detects format (HAR if JSON,
+        native tnetstring otherwise).
+
+        Args:
+            file_path: Path to .har or .mitm/.flow file.
+            append: If False, clear existing traffic before import.
+            scope: Optional list of domains to filter by during import.
+
+        Returns:
+            Dict with import stats: {"imported": int, "skipped": int, "errors": int}
+        """
+        if not append:
+            self.clear()
+
+        stats = {"imported": 0, "skipped": 0, "errors": 0}
+
+        with open(file_path, "rb") as f:
+            reader = FlowReader(f)
+            for flow in reader.stream():
+                try:
+                    if not isinstance(flow, http.HTTPFlow):
+                        stats["skipped"] += 1
+                        continue
+
+                    if scope:
+                        host = urlparse(flow.request.url).hostname or ""
+                        if not any(d in host for d in scope):
+                            stats["skipped"] += 1
+                            continue
+
+                    self.save_flow(flow)
+                    stats["imported"] += 1
+                except Exception as e:
+                    stats["errors"] += 1
+                    print(
+                        f"Skipped flow during import: {e}",
+                        file=sys.stderr,
+                    )
+
+        return stats
 
     def _generate_curl(self, request: SimpleRequest) -> str:
         try:

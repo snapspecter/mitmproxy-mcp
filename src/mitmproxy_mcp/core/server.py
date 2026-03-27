@@ -250,6 +250,41 @@ async def inspect_flow(flow_id: str) -> str:
 
 
 @mcp.tool()
+async def load_traffic_file(
+    file_path: str,
+    append: bool = False,
+    scope: str = None,
+) -> str:
+    """
+    Import flows from a HAR or mitmproxy flow file into the traffic database.
+    After import, all traffic inspection tools work on the imported data.
+    No proxy needs to be running.
+    Args:
+        file_path: Path to .har or .mitm/.flow file
+        append: If True, keep existing traffic. If False (default), clear first.
+        scope: Comma-separated list of domains to filter by during import.
+            Only flows matching these domains are imported.
+    """
+    scope_list = (
+        [d.strip() for d in scope.split(",") if d.strip()] if scope else None
+    )
+    try:
+        stats = controller.recorder.db.import_from_file(
+            file_path, append=append, scope=scope_list
+        )
+        return json.dumps(
+            {
+                "status": "ok",
+                "imported": stats["imported"],
+                "skipped": stats["skipped"],
+                "errors": stats["errors"],
+            }
+        )
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool()
 async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: str = None) -> str:
     """
     Extract specific data from a flow's response body using JSONPath or CSS
