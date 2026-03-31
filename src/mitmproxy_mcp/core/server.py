@@ -300,10 +300,9 @@ async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: s
         return "No matching flow."
 
     response = flow_data.get("response")
-    if not response or not response.get("body"):
+    body_content = response.get("body_preview") if response else None
+    if not body_content:
         return "Flow has no response body."
-
-    body_content = response["body"]
 
     if json_path:
         try:
@@ -377,10 +376,11 @@ async def extract_session_variable(
         return "No matching flow."
 
     response = flow_data.get("response")
-    if not response or not response.get("body"):
+    body_content = response.get("body_preview") if response else None
+    if not body_content:
         return "Flow has no response body."
     try:
-        match = re.search(regex_pattern, response["body"])
+        match = re.search(regex_pattern, body_content)
         if match:
             value = match.group(group_index)
             controller.session_variables[name] = value
