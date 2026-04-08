@@ -87,12 +87,32 @@ class MitmController:
     async def stop(self):
         if not self.running or not self.master:
             return "The proxy isn't running right now."
+        # Explicitly stop all server instances to release the listening port
+        # and close all active connections (keepalive connections otherwise persist)
+        ps_addon = self.master.addons.get("proxyserver")
+        if ps_addon:
+            for handler in list(ps_addon.connections.values()):
+                try:
+                    for transport_io in list(handler.transports.values()):
+                        if transport_io.writer and not transport_io.writer.is_closing():
+                            transport_io.writer.close()
+                except Exception:
+                    pass
+            for instance in list(ps_addon.servers._instances.values()):
+                try:
+                    await instance.stop()
+                except Exception:
+                    pass
+            ps_addon.servers._instances.clear()
         self.master.shutdown()
         if self.proxy_task:
-            try:
-                await self.proxy_task
-            except asyncio.CancelledError:
-                pass
+            done, _ = await asyncio.wait({self.proxy_task}, timeout=5.0)
+            if not done:
+                self.proxy_task.cancel()
+                try:
+                    await self.proxy_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             self.proxy_task = None
         self.running = False
         logger.info("proxy_stopped")
