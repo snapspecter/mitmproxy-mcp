@@ -1,25 +1,26 @@
 import asyncio
 import logging
+import os
 import sys
 import json
 from collections import Counter
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, parse_qsl
 import re
-
 
 import structlog
 
 from mcp.server.fastmcp import FastMCP
+from mitmproxy import options
+from mitmproxy.tools.dump import DumpMaster
 from curl_cffi.requests import AsyncSession
 from jsonpath_ng import parse as parse_jsonpath
 from bs4 import BeautifulSoup
 
-from ..models import InterceptionRule
-from .generation import normalize_scraper_flows, render_scraper_code
-from .tui import start_tui_monitor
-from .controller import controller
-
+from ..models import ScopeConfig, InterceptionRule
+from .scope import ScopeManager
+from .recorder import TrafficRecorder
+from .interceptor import TrafficInterceptor
 
 # Configure structlog
 structlog.configure(
@@ -41,10 +42,172 @@ logging.basicConfig(
 
 logger = structlog.get_logger()
 
+
+class MitmController:
+    def __init__(self):
+        self.master: Optional[DumpMaster] = None
+        self.proxy_task: Optional[asyncio.Task] = None
+        self.scope_config = ScopeConfig()
+        self.scope_manager = ScopeManager(self.scope_config)
+        self.recorder = TrafficRecorder(self.scope_manager)
+        self.interceptor = TrafficInterceptor()
+        self.running = False
+        self.port = 8080
+        self.session_variables = {}
+
+    def _get_verify_param(self, verify_override: Optional[bool] = None) -> Any:
+        if verify_override is not None:
+            return verify_override
+
+        cert_path = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
+        if os.path.exists(cert_path):
+            return cert_path
+
+        return True
+
+    async def start(self, port: int = 8080, host: str = "127.0.0.1"):
+        if self.running:
+            return "MITM is already running."
+
+        self.port = port
+        opts = options.Options(listen_host=host, listen_port=port)
+        self.master = DumpMaster(
+            opts,
+            with_termlog=False,
+            with_dumper=False,
+        )
+        self.master.addons.add(self.recorder)
+        self.master.addons.add(self.interceptor)
+
+        self.proxy_task = asyncio.create_task(self.master.run())
+        self.running = True
+        logger.info("proxy_started", host=host, port=port)
+        return f"Started proxy on port {port}"
+
+    async def stop(self):
+        if not self.running or not self.master:
+            return "The proxy isn't running right now."
+        # Explicitly stop all server instances to release the listening port
+        # and close all active connections (keepalive connections otherwise persist)
+        ps_addon = self.master.addons.get("proxyserver")
+        if ps_addon:
+            for handler in list(ps_addon.connections.values()):
+                try:
+                    for transport_io in list(handler.transports.values()):
+                        if transport_io.writer and not transport_io.writer.is_closing():
+                            transport_io.writer.close()
+                except Exception:
+                    pass
+            for instance in list(ps_addon.servers._instances.values()):
+                try:
+                    await instance.stop()
+                except Exception:
+                    pass
+            ps_addon.servers._instances.clear()
+        self.master.shutdown()
+        if self.proxy_task:
+            done, _ = await asyncio.wait({self.proxy_task}, timeout=5.0)
+            if not done:
+                self.proxy_task.cancel()
+                try:
+                    await self.proxy_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self.proxy_task = None
+        self.running = False
+        logger.info("proxy_stopped")
+        return "Stopped the proxy."
+
+    async def replay_request(
+        self,
+        flow_id: str,
+        method: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        body: Optional[str] = None,
+        timeout: float = 30.0,
+    ) -> str:
+        """
+        Re-executes captured request using curl_cffi
+        """
+        # Fetch flow details from DB (dict)
+        flow_data = self.recorder.get_flow_detail(flow_id)
+        if not flow_data:
+            return "Couldn't find that flow"
+
+        original_request = flow_data["request"]
+        target_url = original_request["url"]
+        target_method = method if method else original_request["method"]
+
+        target_headers = dict(original_request["headers"])
+        target_headers.pop("Host", None)
+        target_headers.pop("Content-Length", None)
+        target_headers.pop("Content-Encoding", None)
+
+        if headers:
+            target_headers.update(headers)
+
+        target_content = None
+        if body is not None:
+            target_content = body
+        else:
+            # Prefer full body from DB; fall back to preview
+            flow_obj = self.recorder.db.get_flow_object(flow_id)
+            if flow_obj and flow_obj.body is not None:
+                target_content = flow_obj.body
+            else:
+                target_content = original_request.get("body_preview")
+            if not target_content:
+                target_content = None
+
+        logger.info(
+            "replay_request",
+            flow_id=flow_id,
+            method=target_method,
+            url=target_url,
+            mode="stealth",
+        )
+
+        proxy_url = f"http://127.0.0.1:{self.port}"
+
+        try:
+            async with AsyncSession(
+                impersonate="chrome120",
+                proxies={
+                    "http": proxy_url,
+                    "https": proxy_url,
+                },
+                verify=self._get_verify_param(),
+                timeout=timeout,
+            ) as client:
+                req_data = None
+                req_content = None
+                if isinstance(target_content, str):
+                    req_data = target_content
+                elif isinstance(target_content, bytes):
+                    req_content = target_content
+
+                response = await client.request(
+                    method=target_method,
+                    url=target_url,
+                    headers=target_headers,
+                    data=req_data,
+                    content=req_content,
+                )
+
+            return f"Replayed successfully! (Status: {response.status_code}). Check the traffic summary for the new flow."
+        except Exception as e:
+            logger.error(f"Replay failed: {e}")
+            return f"That didn't work: {str(e)}"
+
+
+# Global Controller Instance
+controller = MitmController()
+
 mcp = FastMCP("Mitmproxy Manager")
 
-
 # --- MCP Tools ---
+
+
 @mcp.tool()
 async def start_proxy(port: int = 8080) -> str:
     try:
@@ -118,44 +281,6 @@ async def inspect_flow(flow_id: str, full_body: bool = False) -> str:
 
 
 @mcp.tool()
-async def get_flow_schema(flow_id: str) -> str:
-    """
-    Extract the JSON schema from a flow's response body.
-    Returns a dict mapping field names to their inferred types.
-    """
-    data = controller.recorder.get_flow_detail(flow_id)
-    if not data:
-        return "Flow not found."
-
-    response = data.get("response", {})
-    body = response.get("body_preview", "")
-
-    # Try to get full body from DB
-    flow_obj = controller.recorder.db.get_flow_object(flow_id)
-    if flow_obj and flow_obj.response and flow_obj.response.content:
-        body = flow_obj.response.content
-        if isinstance(body, bytes):
-            body = body.decode("utf-8", errors="ignore")
-
-    if not body:
-        return "No response body found."
-
-    try:
-        parsed = json.loads(body)
-    except json.JSONDecodeError:
-        return "Response body is not valid JSON."
-
-    if not isinstance(parsed, dict):
-        return f"Response is JSON but not an object (it's {type(parsed).__name__})."
-
-    schema = {}
-    for key, value in parsed.items():
-        schema[key] = type(value).__name__
-
-    return json.dumps(schema, indent=2)
-
-
-@mcp.tool()
 async def inspect_flows(
     flow_ids: str,
     fields: str = None,
@@ -172,12 +297,16 @@ async def inspect_flows(
         full_body: If True, return full request body instead of preview
     """
     ids = [fid.strip() for fid in flow_ids.split(",") if fid.strip()]
-    columns = [c.strip() for c in fields.split(",") if c.strip()] if fields else None
+    columns = (
+        [c.strip() for c in fields.split(",") if c.strip()] if fields else None
+    )
     # Always include id in columns
     if columns and "id" not in columns:
         columns.insert(0, "id")
 
-    results = controller.recorder.db.get_by_ids(ids, columns=columns, ordered_headers=True)
+    results = controller.recorder.db.get_by_ids(
+        ids, columns=columns, ordered_headers=True
+    )
 
     if full_body and not columns:
         # Replace truncated previews with full bodies
@@ -207,17 +336,22 @@ async def load_traffic_file(
         scope: Comma-separated list of domains to filter by during import.
             Only flows matching these domains are imported.
     """
-    scope_list = [d.strip() for d in scope.split(",") if d.strip()] if scope else None
+    scope_list = (
+        [d.strip() for d in scope.split(",") if d.strip()] if scope else None
+    )
     try:
         stats = await asyncio.to_thread(
-            controller.recorder.db.import_from_file, file_path, append=append, scope=scope_list
+            controller.recorder.db.import_from_file,
+            file_path, append=append, scope=scope_list
         )
-        return json.dumps({
-            "status": "ok",
-            "imported": stats["imported"],
-            "skipped": stats["skipped"],
-            "errors": stats["errors"],
-        })
+        return json.dumps(
+            {
+                "status": "ok",
+                "imported": stats["imported"],
+                "skipped": stats["skipped"],
+                "errors": stats["errors"],
+            }
+        )
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -297,7 +431,9 @@ async def set_session_variable(name: str, value: str) -> str:
 
 
 @mcp.tool()
-async def extract_session_variable(name: str, flow_id: str, regex_pattern: str, group_index: int = 1) -> str:
+async def extract_session_variable(
+    name: str, flow_id: str, regex_pattern: str, group_index: int = 1
+) -> str:
     """
     Extract a value from a flow's response body using a regex and store it as a session variable.
     Args:
@@ -321,7 +457,7 @@ async def extract_session_variable(name: str, flow_id: str, regex_pattern: str, 
             controller.session_variables[name] = value
             return f"Extracted and set ${name} = {value}"
         else:
-            return "Pattern not found in response body."
+            return f"Pattern not found in response body."
     except Exception as e:
         return f"Error applying regex: {str(e)}"
 
@@ -547,7 +683,9 @@ async def replay_flow(
 
     if controller.session_variables:
         if resolved_headers_json:
-            resolved_headers_json = _resolve_template(resolved_headers_json, controller.session_variables)
+            resolved_headers_json = _resolve_template(
+                resolved_headers_json, controller.session_variables
+            )
         if resolved_body:
             resolved_body = _resolve_template(resolved_body, controller.session_variables)
 
@@ -624,7 +762,9 @@ async def list_tools() -> str:
     tools = await mcp.list_tools()
     tool_list = []
     for tool in tools:
-        tool_list.append({"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema})
+        tool_list.append(
+            {"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema}
+        )
     return json.dumps(tool_list, indent=2)
 
 
@@ -709,22 +849,27 @@ def _generate_openapi_spec(
 
         # Add path params
         for param in cluster["path_params"]:
-            operation["parameters"].append({
-                "name": param,
-                "in": "path",
-                "required": True,
-                "schema": {"type": "string"},
-            })
+            operation["parameters"].append(
+                {
+                    "name": param,
+                    "in": "path",
+                    "required": True,
+                    "schema": {"type": "string"},
+                }
+            )
 
         # Add query params
         for param in cluster["query_params"]:
-            operation["parameters"].append({
-                "name": param,
-                "in": "query",
-                # TODO: Implement type inference for query params based on values in flows. For now we'll default to string, but would be nice to detect ints, bools, enums, etc. by analyzing the captured values across flows.
-                "schema": {"type": "string"},
-            })
+            operation["parameters"].append(
+                {
+                    "name": param,
+                    "in": "query",
+                    # We could guess type here, default to string
+                    "schema": {"type": "string"},
+                }
+            )
 
+        # Add headers as parameters if significant
         # (simplified, ignoring common browser headers already handled)
 
         # Responses
@@ -758,12 +903,12 @@ def _generate_openapi_spec(
 
 
 @mcp.tool()
-async def export_openapi_spec(domain: str = None, limit: int = 50) -> str:
+async def export_openapi_spec(domain: str = None, limit: int = None) -> str:
     """
     Exports captured API traffic patterns to an OpenAPI v3 JSON specification.
     Args:
         domain: Filter traffic by domain
-        limit: Max number of traffic flows to analyze
+        limit: Max number of traffic flows to analyze. None = all flows.
     """
     patterns_json = await get_api_patterns(domain, limit)
     clusters = json.loads(patterns_json)
@@ -776,14 +921,20 @@ async def export_openapi_spec(domain: str = None, limit: int = 50) -> str:
 
 
 @mcp.tool()
-async def get_api_patterns(domain: str = None, limit: int = 50) -> str:
-    # Fetch flows from DB
-    flows = controller.recorder.get_all_for_analysis(limit * 5)  # Fetch more to filter locally
+async def get_api_patterns(domain: str = None, limit: int = None) -> str:
+    """
+    Cluster captured traffic into endpoint patterns.
+    Args:
+        domain: Filter traffic by domain
+        limit: Max number of flows to analyze. None = all flows.
+    """
+    flows = controller.recorder.get_all_for_analysis(lightweight=True)
 
     if domain:
         flows = [f for f in flows if domain in f["request"]["url"]]
 
-    flows = flows[:limit]  # Re-limit
+    if limit is not None:
+        flows = flows[:limit]
 
     endpoint_clusters: Dict[str, Dict[str, Any]] = {}
 
@@ -835,18 +986,20 @@ async def get_api_patterns(domain: str = None, limit: int = 50) -> str:
 
     result = []
     for key, cluster in sorted(endpoint_clusters.items(), key=lambda x: -x[1]["count"]):
-        result.append({
-            "endpoint": key,
-            "method": cluster["method"],
-            "path_pattern": cluster["path_pattern"],
-            "path_params": cluster["path_params"],
-            "query_params": list(cluster["query_params"]),
-            "common_headers": dict(cluster["request_headers"].most_common(10)),
-            "status_codes": dict(cluster["response_status_codes"]),
-            "content_types": dict(cluster["content_types"]),
-            "request_count": cluster["count"],
-            "sample_flow_ids": cluster["sample_flow_ids"][:3],
-        })
+        result.append(
+            {
+                "endpoint": key,
+                "method": cluster["method"],
+                "path_pattern": cluster["path_pattern"],
+                "path_params": cluster["path_params"],
+                "query_params": list(cluster["query_params"]),
+                "common_headers": dict(cluster["request_headers"].most_common(10)),
+                "status_codes": dict(cluster["response_status_codes"]),
+                "content_types": dict(cluster["content_types"]),
+                "request_count": cluster["count"],
+                "sample_flow_ids": cluster["sample_flow_ids"][:3],
+            }
+        )
 
     return json.dumps(result, indent=2)
 
@@ -956,32 +1109,330 @@ async def generate_scraper_code(flow_ids: str, target_framework: str = "curl_cff
     flow IDs.
     Args:
         flow_ids: Comma-separated list of flow IDs to include in the script.
-        target_framework: The framework to generate code for.
+        target_framework: The framework to generate code for (TODO: Add
+        additional frameworks: Only 'curl_cffi' is currently supported).
     """
     ids = [fid.strip() for fid in flow_ids.split(",") if fid.strip()]
-    flows_data = [controller.recorder.get_flow_detail(fid) for fid in ids]
-    flows_data = [flow for flow in flows_data if flow is not None]
+    flows_data = []
+
+    for fid in ids:
+        data = controller.recorder.get_flow_detail(fid)
+        if data:
+            flows_data.append(data)
 
     if not flows_data:
         return "No valid flows found for the provided IDs."
 
-    normalized_flows = normalize_scraper_flows(flows_data, controller.recorder)
-    return render_scraper_code(target_framework, normalized_flows)
+    if target_framework == "curl_cffi":
+        code = [
+            "import asyncio",
+            "import json",
+            "from curl_cffi.requests import AsyncSession",
+            "",
+            "async def run_scraper():",
+            "    # Generated by mitmproxy-mcp",
+            "    async with AsyncSession(",
+            "        impersonate='chrome120', verify=False",
+            "    ) as client:",
+        ]
+
+        for i, flow in enumerate(flows_data):
+            req = flow["request"]
+            url = req["url"]
+            method = req["method"]
+
+            headers = dict(req["headers"])
+            headers.pop("Host", None)
+            headers.pop("Content-Length", None)
+            headers.pop("Content-Encoding", None)
+
+            # Prefer richer in-memory flow object when available,
+            # then DB fallback.
+            body = req.get("body_preview")
+
+            live_flow = controller.recorder.get_live_flow(flow["id"])
+            if live_flow and live_flow.request and live_flow.request.content:
+                try:
+                    body = live_flow.request.content.decode("utf-8")
+                except UnicodeDecodeError:
+                    body = body or "<binary data omitted>"
+            else:
+                flow_obj = controller.recorder.db.get_flow_object(flow["id"])
+                if flow_obj and flow_obj.body:
+                    body = flow_obj.body
+
+            safe_method = json.dumps(method)
+            safe_url = json.dumps(url)
+            safe_url_preview = json.dumps(url[:50])
+            step_line = f"        print(f'\\n[Step {i + 1}] Executing ' + {safe_method} + ' ' + {safe_url_preview} + '...')"
+            code.append(step_line)
+
+            headers_str = json.dumps(headers, indent=12).strip()
+            # Indent subsequent lines
+            headers_str = headers_str.replace("\n", "\n        ")
+
+            code.append(f"        headers_{i} = {headers_str}")
 
 
-@mcp.tool()
-async def start_monitor() -> str:
-    """
-    Start the terminal UI monitor for live traffic inspection.
-    This launches a separate TUI that displays live request/response streams,
-    active interception rules, and auth tokens.
-    """
-    try:
-        # Start the TUI in the background
-        asyncio.create_task(start_tui_monitor())
-        return "TUI monitor started. It should appear in a new terminal window or tab."
-    except Exception as e:
-        return f"Failed to start TUI monitor: {e}"
+            kwargs = f"method={safe_method}, url={safe_url}, headers=headers_{i}"
+
+            if body and body != "<binary data omitted>":
+                # Escape quotes
+                safe_body = json.dumps(body)
+                code.append(f"        data_{i} = {safe_body}")
+                kwargs += f", data=data_{i}"
+
+            code.append("        try:")
+            code.append(f"            response_{i} = await client.request({kwargs})")
+            code.append(f"            print(f'Status: {{response_{i}.status_code}}')")
+            code.append(f"            # print(response_{i}.text[:200])")
+            code.append(f"        except Exception as e:")
+            code.append(f"            print(f'Error: {{e}}')")
+            code.append("")
+
+        code.extend(
+            [
+                "if __name__ == '__main__':",
+                "    asyncio.run(run_scraper())",
+            ]
+        )
+
+        return "\n".join(code)
+
+    elif target_framework == "requests":
+        code = [
+            "import json",
+            "import requests",
+            "",
+            "def run_scraper():",
+            "    # Generated by mitmproxy-mcp",
+            "    # Note: requests does not impersonate browser fingerprints like curl_cffi",
+            "    with requests.Session() as client:",
+            "        client.verify = False  # Ignore SSL warnings",
+        ]
+
+        for i, flow in enumerate(flows_data):
+            req = flow["request"]
+            url = req["url"]
+            method = req["method"]
+
+            headers = dict(req["headers"])
+            headers.pop("Host", None)
+            headers.pop("Content-Length", None)
+            headers.pop("Content-Encoding", None)
+
+            body = req.get("body_preview")
+            live_flow = controller.recorder.get_live_flow(flow["id"])
+            if live_flow and live_flow.request and live_flow.request.content:
+                try:
+                    body = live_flow.request.content.decode("utf-8")
+                except UnicodeDecodeError:
+                    body = body or "<binary data omitted>"
+            else:
+                flow_obj = controller.recorder.db.get_flow_object(flow["id"])
+                if flow_obj and flow_obj.body:
+                    body = flow_obj.body
+
+            step_line = f"        print(f'\\n[Step {i + 1}] Executing {method} {url[:50]}...')"
+            code.append(step_line)
+
+            headers_str = json.dumps(headers, indent=12).strip()
+            headers_str = headers_str.replace("\n", "\n        ")
+            code.append(f"        headers_{i} = {headers_str}")
+
+            safe_url = json.dumps(url)
+            safe_method = json.dumps(method)
+            kwargs = f"method={safe_method}, url={safe_url}, headers=headers_{i}, timeout=30"
+
+            if body and body != "<binary data omitted>":
+                safe_body = json.dumps(body)
+                code.append(f"        data_{i} = {safe_body}")
+                kwargs += f", data=data_{i}"
+
+            code.append("        try:")
+            code.append(f"            response_{i} = client.request({kwargs})")
+            code.append(f"            print(f'Status: {{response_{i}.status_code}}')")
+            code.append(f"            # print(response_{i}.text[:200])")
+            code.append("        except Exception as e:")
+            code.append("            print(f'Error: {e}')")
+            code.append("")
+
+        code.extend(
+            [
+                "if __name__ == '__main__':",
+                "    import urllib3",
+                "    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)",
+                "    run_scraper()",
+            ]
+        )
+
+        return "\n".join(code)
+
+    elif target_framework == "aiohttp":
+        code = [
+            "import asyncio",
+            "import json",
+            "import aiohttp",
+            "",
+            "async def run_scraper():",
+            "    # Generated by mitmproxy-mcp",
+            "    # Note: aiohttp does not impersonate browser fingerprints like curl_cffi",
+            "    timeout = aiohttp.ClientTimeout(total=30)",
+            "    connector = aiohttp.TCPConnector(verify_ssl=False)",
+            "    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as client:",
+        ]
+
+        for i, flow in enumerate(flows_data):
+            req = flow["request"]
+            url = req["url"]
+            method = req["method"]
+
+            headers = dict(req["headers"])
+            headers.pop("Host", None)
+            headers.pop("Content-Length", None)
+            headers.pop("Content-Encoding", None)
+
+            body = req.get("body_preview")
+            live_flow = controller.recorder.get_live_flow(flow["id"])
+            if live_flow and live_flow.request and live_flow.request.content:
+                try:
+                    body = live_flow.request.content.decode("utf-8")
+                except UnicodeDecodeError:
+                    body = body or "<binary data omitted>"
+            else:
+                flow_obj = controller.recorder.db.get_flow_object(flow["id"])
+                if flow_obj and flow_obj.body:
+                    body = flow_obj.body
+
+            step_line = f"        print(f'\\n[Step {i + 1}] Executing {method} {url[:50]}...')"
+            code.append(step_line)
+
+            headers_str = json.dumps(headers, indent=12).strip()
+            headers_str = headers_str.replace("\n", "\n        ")
+            code.append(f"        headers_{i} = {headers_str}")
+
+            safe_url = json.dumps(url)
+            safe_method = json.dumps(method)
+            kwargs = f"url={safe_url}, headers=headers_{i}"
+
+            if body and body != "<binary data omitted>":
+                safe_body = json.dumps(body)
+                code.append(f"        data_{i} = {safe_body}")
+                kwargs += f", data=data_{i}"
+
+            code.append(f"        try:")
+            code.append(
+                f"            async with client.request({safe_method}, {kwargs}) as response_{i}:"
+            )
+            code.append(f"                print(f'Status: {{response_{i}.status}}')")
+            code.append(f"                text_{i} = await response_{i}.text()")
+            code.append(f"                # print(text_{i}[:200])")
+            code.append(f"        except Exception as e:")
+            code.append(f"            print(f'Error: {{e}}')")
+            code.append("")
+
+        code.extend(
+            [
+                "if __name__ == '__main__':",
+                "    asyncio.run(run_scraper())",
+            ]
+        )
+
+        return "\n".join(code)
+
+    elif target_framework == "playwright":
+        code = [
+            "import asyncio",
+            "import json",
+            "from playwright.async_api import async_playwright",
+            "",
+            "async def run_scraper():",
+            "    # Generated by mitmproxy-mcp",
+            "    async with async_playwright() as p:",
+            "        browser = await p.chromium.launch(headless=True)",
+            "        # Use a context to preserve cookies and session state across requests",
+            "        context = await browser.new_context(ignore_https_errors=True)",
+            "        page = await context.new_page()",
+            "        page.set_default_timeout(30000)",
+        ]
+
+        for i, flow in enumerate(flows_data):
+            req = flow["request"]
+            url = req["url"]
+            method = req["method"]
+
+            headers = dict(req["headers"])
+            headers.pop("Host", None)
+            headers.pop("Content-Length", None)
+            headers.pop("Content-Encoding", None)
+
+            # Determine if this looks like a browser navigation or an API call
+            accept_header = headers.get("Accept") or headers.get("accept") or ""
+            is_navigation = method.upper() == "GET" and "text/html" in str(accept_header)
+
+            body = req.get("body_preview")
+            live_flow = controller.recorder.get_live_flow(flow["id"])
+            if live_flow and live_flow.request and live_flow.request.content:
+                try:
+                    body = live_flow.request.content.decode("utf-8")
+                except UnicodeDecodeError:
+                    body = body or "<binary data omitted>"
+            else:
+                flow_obj = controller.recorder.db.get_flow_object(flow["id"])
+                if flow_obj and flow_obj.body:
+                    body = flow_obj.body
+
+            step_line = f"        print(f'\\n[Step {i + 1}] Executing {method} {url[:50]}...')"
+            code.append(step_line)
+
+            headers_str = json.dumps(headers, indent=12).strip()
+            headers_str = headers_str.replace("\n", "\n        ")
+            code.append(f"        headers_{i} = {headers_str}")
+
+            safe_url = json.dumps(url)
+            safe_method = json.dumps(method)
+
+            if is_navigation:
+                code.append(f"        try:")
+                code.append(f"            # Attempting to navigate the page directly")
+                code.append(f"            response_{i} = await page.goto({safe_url})")
+                code.append(
+                    f"            print(f'Status: {{response_{i}.status if response_{i} else \"Unknown\"}}')"
+                )
+                code.append(f"            # content_{i} = await page.content()")
+                code.append(f"            # print(content_{i}[:200])")
+                code.append(f"        except Exception as e:")
+                code.append(f"            print(f'Error: {{e}}')")
+            else:
+                kwargs = f"{safe_url}, method={safe_method}, headers=headers_{i}"
+                if body and body != "<binary data omitted>":
+                    safe_body = json.dumps(body)
+                    code.append(f"        data_{i} = {safe_body}")
+                    kwargs += f", data=data_{i}"
+
+                code.append(f"        try:")
+                code.append(f"            response_{i} = await context.request.fetch({kwargs})")
+                code.append(f"            print(f'Status: {{response_{i}.status}}')")
+                code.append(f"            # text_{i} = await response_{i}.text()")
+                code.append(f"            # print(text_{i}[:200])")
+                code.append(f"        except Exception as e:")
+                code.append(f"            print(f'Error: {{e}}')")
+
+            code.append("")
+
+        code.extend(
+            [
+                "        await browser.close()",
+                "",
+                "if __name__ == '__main__':",
+                "    asyncio.run(run_scraper())",
+            ]
+        )
+
+        return "\n".join(code)
+
+    else:
+        return f"Framework '{target_framework}' is not supported yet."
 
 
 def start():
