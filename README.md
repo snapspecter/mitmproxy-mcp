@@ -176,6 +176,5 @@ uv run pytest
 
 **License:** MIT
 
-**Author:** [SnapSpecter](https://github.com/snapspecter)
 
 ```

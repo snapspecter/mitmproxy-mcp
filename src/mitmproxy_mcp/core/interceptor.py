@@ -41,6 +41,9 @@ class TrafficInterceptor:
         self.rules.clear()
         self._compiled_patterns.clear()
 
+    def get_active_rules(self):
+        return list(self.rules.values())
+
     def request(self, flow: http.HTTPFlow):
         self._apply_rules(flow, "request")
 
