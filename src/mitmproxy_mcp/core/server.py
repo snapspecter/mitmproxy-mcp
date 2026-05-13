@@ -7,6 +7,7 @@ from collections import Counter
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, parse_qsl
 import re
+import re2
 
 import structlog
 
@@ -179,20 +180,17 @@ class MitmController:
                 verify=self._get_verify_param(),
                 timeout=timeout,
             ) as client:
-                req_data = None
-                req_content = None
+                request_kwargs = {
+                    "method": target_method,
+                    "url": target_url,
+                    "headers": target_headers,
+                }
                 if isinstance(target_content, str):
-                    req_data = target_content
+                    request_kwargs["data"] = target_content
                 elif isinstance(target_content, bytes):
-                    req_content = target_content
+                    request_kwargs["data"] = target_content
 
-                response = await client.request(
-                    method=target_method,
-                    url=target_url,
-                    headers=target_headers,
-                    data=req_data,
-                    content=req_content,
-                )
+                response = await client.request(**request_kwargs)
 
             return f"Replayed successfully! (Status: {response.status_code}). Check the traffic summary for the new flow."
         except Exception as e:
@@ -297,9 +295,15 @@ async def inspect_flows(
         full_body: If True, return full request body instead of preview
     """
     ids = [fid.strip() for fid in flow_ids.split(",") if fid.strip()]
-    columns = (
-        [c.strip() for c in fields.split(",") if c.strip()] if fields else None
-    )
+    columns = [c.strip() for c in fields.split(",")] if fields else None
+    derived_fields = set()
+    if columns:
+        derived_fields = {c for c in columns if c in {"content_type", "response_content_type"}}
+        if derived_fields:
+            if "response_headers" not in columns:
+                columns.append("response_headers")
+            # Remove derived field names before passing to DB query
+            columns = [c for c in columns if c not in derived_fields]
     # Always include id in columns
     if columns and "id" not in columns:
         columns.insert(0, "id")
@@ -307,6 +311,16 @@ async def inspect_flows(
     results = controller.recorder.db.get_by_ids(
         ids, columns=columns, ordered_headers=True
     )
+
+    if derived_fields:
+        for entry in results:
+            headers = entry.get("response", {}).get("headers") or []
+            header_dict = {k.lower(): v for k, v in headers}
+            content_type = header_dict.get("content-type", "unknown")
+            if "content_type" in derived_fields:
+                entry["content_type"] = content_type
+            if "response_content_type" in derived_fields:
+                entry["response_content_type"] = content_type
 
     if full_body and not columns:
         # Replace truncated previews with full bodies
@@ -318,6 +332,58 @@ async def inspect_flows(
                     req["body"] = flow_obj.body
 
     return json.dumps(results, indent=2)
+
+
+def _json_type_name(value: Any) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, dict):
+        return "dict"
+    if value is None:
+        return "null"
+    return type(value).__name__
+
+
+@mcp.tool()
+async def get_flow_schema(flow_id: str) -> str:
+    """Infer a simple schema from a flow's JSON response body."""
+    flow_data = controller.recorder.get_flow_detail(flow_id)
+    if not flow_data:
+        return "Flow not found."
+
+    response = flow_data.get("response")
+    body_content = response.get("body_preview") if response else None
+
+    flow_obj = controller.recorder.db.get_flow_object(flow_id)
+    response_obj = getattr(flow_obj, "response", None) if flow_obj else None
+    full_content = getattr(response_obj, "content", None) if response_obj else None
+    if full_content:
+        if isinstance(full_content, bytes):
+            body_content = full_content.decode("utf-8", errors="replace")
+        else:
+            body_content = str(full_content)
+
+    if not body_content:
+        return "Flow has no response body."
+
+    try:
+        data = json.loads(body_content)
+    except json.JSONDecodeError:
+        return "Response body is not valid JSON."
+
+    if not isinstance(data, dict):
+        return f"Response is JSON but not an object (it's {type(data).__name__})."
+
+    schema = {key: _json_type_name(value) for key, value in data.items()}
+    return json.dumps(schema, indent=2)
 
 
 @mcp.tool()
@@ -451,7 +517,7 @@ async def extract_session_variable(
     if not body_content:
         return "Flow has no response body."
     try:
-        match = re.search(regex_pattern, body_content)
+        match = re2.search(regex_pattern, body_content)
         if match:
             value = match.group(group_index)
             controller.session_variables[name] = value
@@ -601,13 +667,15 @@ async def fuzz_endpoint(
             # Coroutine for the request
             async def run_req(p=payload, u=req_url, b=req_body):
                 try:
-                    resp = await client.request(
-                        method=method,
-                        url=u,
-                        headers=target_headers,
-                        data=b if isinstance(b, str) else None,
-                        content=b if isinstance(b, bytes) else None,
-                    )
+                    request_kwargs = {
+                        "method": method,
+                        "url": u,
+                        "headers": target_headers,
+                    }
+                    if b is not None:
+                        request_kwargs["data"] = b
+
+                    resp = await client.request(**request_kwargs)
 
                     status = resp.status_code
                     content_len = len(resp.content) if resp.content else 0
@@ -681,6 +749,10 @@ async def replay_flow(
     resolved_headers_json = headers_json
     resolved_body = body
 
+    # Treat the sentinel value "__omit__" as no body
+    if resolved_body == "__omit__":
+        resolved_body = None
+
     if controller.session_variables:
         if resolved_headers_json:
             resolved_headers_json = _resolve_template(
@@ -733,7 +805,8 @@ async def add_interception_rule(
     except Exception as e:
         return f"Invalid rule parameters: {str(e)}"
 
-    controller.interceptor.add_rule(rule)
+    if not controller.interceptor.add_rule(rule):
+        return f"Invalid or unsupported regex for rule '{rule_id}'"
     return f"Added rule '{rule_id}'"
 
 
@@ -772,8 +845,6 @@ async def list_tools() -> str:
 
 
 def _normalize_path(path: str) -> Tuple[str, List[str]]:
-    import re
-
     segments = path.split("/")
     normalized = []
     params = []

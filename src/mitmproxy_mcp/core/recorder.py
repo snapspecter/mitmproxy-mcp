@@ -550,3 +550,11 @@ class TrafficRecorder:
         self, limit: Optional[int] = None, lightweight: bool = False
     ) -> List[Dict[str, Any]]:
         return self.db.get_all_for_analysis(limit, lightweight=lightweight)
+
+    def get_by_ids(
+        self,
+        flow_ids: List[str],
+        columns: Optional[List[str]] = None,
+        ordered_headers: bool = False,
+    ) -> List[Dict[str, Any]]:
+        return self.db.get_by_ids(flow_ids, columns=columns, ordered_headers=ordered_headers)

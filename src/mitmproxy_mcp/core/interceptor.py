@@ -1,6 +1,6 @@
-import re
 import logging
-from typing import Dict
+from typing import Any, Dict
+import re2
 from mitmproxy import http
 from ..models import InterceptionRule
 from .utils import get_safe_text
@@ -13,23 +13,23 @@ class TrafficInterceptor:
 
     def __init__(self):
         self.rules: Dict[str, InterceptionRule] = {}
-        self._compiled_patterns: Dict[str, Dict[str, re.Pattern]] = {}
+        self._compiled_patterns: Dict[str, Dict[str, Any]] = {}
 
-    def add_rule(self, rule: InterceptionRule):
-        self.rules[rule.id] = rule
-
-        # Pre-compile regex patterns
+    def add_rule(self, rule: InterceptionRule) -> bool:
         patterns = {}
         try:
             if rule.url_pattern:
-                patterns["url"] = re.compile(rule.url_pattern)
+                patterns["url"] = re2.compile(rule.url_pattern)
             if rule.search_pattern:
-                patterns["search"] = re.compile(rule.search_pattern)
-        except re.error as e:
+                patterns["search"] = re2.compile(rule.search_pattern)
+        except re2.error as e:
             logger.warning("Failed to compile regex for rule %s: %s", rule.id, e)
+            return False
 
+        self.rules[rule.id] = rule
         self._compiled_patterns[rule.id] = patterns
         logger.info("Added interception rule: %s", rule)
+        return True
 
     def remove_rule(self, rule_id: str):
         if rule_id in self.rules:
@@ -68,9 +68,6 @@ class TrafficInterceptor:
             if url_pattern:
                 if not url_pattern.search(flow.request.url):
                     continue
-            elif rule.url_pattern:
-                if not re.search(rule.url_pattern, flow.request.url):
-                    continue
 
             try:
                 if (
@@ -96,11 +93,7 @@ class TrafficInterceptor:
                         if search_pattern:
                             new_text = search_pattern.sub(rule.value, text)
                         else:
-                            new_text = re.sub(
-                                rule.search_pattern,
-                                rule.value,
-                                text,
-                            )
+                            continue
                         message.text = new_text
                         logger.info(
                             "Body modified by rule: '%s'",
