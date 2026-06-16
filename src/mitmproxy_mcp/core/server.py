@@ -280,22 +280,50 @@ async def get_upstream_command(
 
 
 @mcp.tool()
-async def run_dynamic_addon(description: str, addon_name: str = "dynamic_addon") -> str:
+async def run_dynamic_addon(
+    description: str = "",
+    addon_name: str = "dynamic_addon",
+    code: Optional[str] = None,
+) -> str:
     """
-    Generate and load a live mitmproxy addon from a natural language description.
+    Load a live mitmproxy addon into the running proxy.
 
-    Claude will write a Python addon class called DynamicAddon with any combination
-    of hook methods (request, response, tls_start_client, etc.), then hot-load it
-    into the running proxy so it takes effect immediately.
+    Two modes:
+    - AI-generated (default): provide a natural-language `description` and Claude
+      (claude-opus-4-8) will write the addon class and hot-load it immediately.
+    - Direct: provide `code` containing a Python class named DynamicAddon and it
+      will be hot-loaded as-is, skipping LLM generation entirely. Use this when
+      you already have the addon code ready.
+
+    The addon class MUST be named DynamicAddon and may implement any mitmproxy
+    hook methods (request, response, tls_start_client, etc.).
+
+    Flow tagging: every hook that accepts a flow should set
+        flow.comment = "addon:<addon_name>"
+    so get_addon_flows() can find which flows this addon touched.
 
     Args:
         description: Natural language description of the desired proxy behaviour
-        addon_name: Logical name used to track / replace this addon (default: dynamic_addon)
+            (ignored when `code` is supplied).
+        addon_name: Logical name used to track / replace this addon (default: dynamic_addon).
+        code: Raw Python source for the DynamicAddon class. When provided, the
+            LLM generation step is skipped and this code is loaded directly.
     """
     if not controller.running or controller.master is None:
         return json.dumps({"status": "error", "message": "Proxy is not running. Start it first."})
 
-    system_prompt = f"""You are an expert mitmproxy addon developer. Write a Python addon class
+    if code is not None:
+        # Direct mode: strip markdown fences if the caller included them
+        code = code.strip()
+        if code.startswith("```"):
+            lines = code.splitlines()
+            code = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+    else:
+        # AI-generated mode
+        if not description:
+            return json.dumps({"status": "error", "message": "Provide either a description or code."})
+
+        system_prompt = f"""You are an expert mitmproxy addon developer. Write a Python addon class
 called DynamicAddon that implements the described behaviour using mitmproxy hooks.
 
 Rules:
@@ -339,25 +367,25 @@ class DynamicAddon:
         pass  # implement here
 """
 
-    client = AsyncAnthropic()
-    response = await client.messages.create(
-        model="claude-opus-4-8",
-        max_tokens=4096,
-        thinking={"type": "adaptive"},
-        system=system_prompt,
-        messages=[{"role": "user", "content": description}],
-    )
+        client = AsyncAnthropic()
+        response = await client.messages.create(
+            model="claude-opus-4-8",
+            max_tokens=4096,
+            thinking={"type": "adaptive"},
+            system=system_prompt,
+            messages=[{"role": "user", "content": description}],
+        )
 
-    code = ""
-    for block in response.content:
-        if block.type == "text":
-            code = block.text.strip()
-            break
+        code = ""
+        for block in response.content:
+            if block.type == "text":
+                code = block.text.strip()
+                break
 
-    # Strip markdown fences if the model included them anyway
-    if code.startswith("```"):
-        lines = code.splitlines()
-        code = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+        # Strip markdown fences if the model included them anyway
+        if code.startswith("```"):
+            lines = code.splitlines()
+            code = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
 
     # Syntax-check before exec
     try:
