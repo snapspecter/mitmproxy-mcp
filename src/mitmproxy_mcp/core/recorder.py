@@ -83,12 +83,17 @@ class TrafficDB:
                     response_headers TEXT,
                     response_body TEXT,
                     timestamp REAL,
-                    size INTEGER
+                    size INTEGER,
+                    comment TEXT DEFAULT ''
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON flows(timestamp)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_url ON flows(url)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_method ON flows(method)")
+            try:
+                conn.execute("ALTER TABLE flows ADD COLUMN comment TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
 
     def save_flow(self, flow: http.HTTPFlow):
         """Upserts a flow into the database."""
@@ -98,6 +103,8 @@ class TrafficDB:
         status_code = flow.response.status_code if flow.response else None
         size = len(flow.response.content) if flow.response and flow.response.content else 0
 
+        comment = getattr(flow, "comment", "") or ""
+
         with self._get_conn() as conn:
             conn.execute(
                 """
@@ -105,8 +112,8 @@ class TrafficDB:
                     id, url, method, status_code,
                     request_headers, request_body,
                     response_headers, response_body,
-                    timestamp, size
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    timestamp, size, comment
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     url=excluded.url,
                     method=excluded.method,
@@ -115,7 +122,8 @@ class TrafficDB:
                     request_body=excluded.request_body,
                     response_headers=excluded.response_headers,
                     response_body=excluded.response_body,
-                    size=excluded.size
+                    size=excluded.size,
+                    comment=excluded.comment
             """,
                 (
                     flow.id,
@@ -140,6 +148,7 @@ class TrafficDB:
                     resp_body,
                     flow.request.timestamp_start,
                     size,
+                    comment,
                 ),
             )
 
@@ -153,7 +162,7 @@ class TrafficDB:
             cursor = conn.execute(
                 """
                 SELECT id, url, method, status_code,
-                       response_headers, timestamp, size
+                       response_headers, timestamp, size, comment
                 FROM flows
                 ORDER BY timestamp DESC
                 LIMIT ? OFFSET ?
@@ -181,6 +190,7 @@ class TrafficDB:
                         "content_type": content_type,
                         "size": row["size"],
                         "timestamp": row["timestamp"],
+                        "comment": row["comment"] or "",
                     }
                 )
             return result
@@ -215,6 +225,7 @@ class TrafficDB:
 
             return {
                 "id": row["id"],
+                "comment": row["comment"] or "",
                 "request": {
                     "method": simple_request.method,
                     "url": simple_request.url,
@@ -232,9 +243,14 @@ class TrafficDB:
             }
 
     def search(
-        self, query: str = None, domain: str = None, method: str = None, limit: int = 50
+        self,
+        query: str = None,
+        domain: str = None,
+        method: str = None,
+        limit: int = 50,
+        comment: str = None,
     ) -> List[Dict[str, Any]]:
-        sql = "SELECT id, url, method, status_code, timestamp FROM flows WHERE 1=1"
+        sql = "SELECT id, url, method, status_code, timestamp, comment FROM flows WHERE 1=1"
         params = []
 
         if domain:
@@ -250,6 +266,10 @@ class TrafficDB:
             wildcard = f"%{query}%"
             params.extend([wildcard, wildcard, wildcard])
 
+        if comment:
+            sql += " AND comment LIKE ?"
+            params.append(f"%{comment}%")
+
         sql += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
 
@@ -257,6 +277,19 @@ class TrafficDB:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(sql, params)
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_comment_histogram(self) -> List[Dict[str, Any]]:
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                """
+                SELECT comment, COUNT(*) as count
+                FROM flows
+                WHERE comment IS NOT NULL AND comment != ''
+                GROUP BY comment
+                ORDER BY count DESC
+                """
+            )
+            return [{"comment": row[0], "count": row[1]} for row in cursor.fetchall()]
 
     def clear(self):
         with self._get_conn() as conn:
@@ -339,8 +372,8 @@ class TrafficDB:
 
         if columns:
             allowed_cols = {
-                "id", "url", "method", "status_code", "request_headers", 
-                "request_body", "response_headers", "response_body", "timestamp", "size"
+                "id", "url", "method", "status_code", "request_headers",
+                "request_body", "response_headers", "response_body", "timestamp", "size", "comment"
             }
             invalid_cols = [c for c in columns if c not in allowed_cols]
             if invalid_cols:
@@ -540,8 +573,18 @@ class TrafficRecorder:
                 return flow
         return None
 
-    def search(self, query: str, domain: str, method: str, limit: int):
-        return self.db.search(query, domain, method, limit)
+    def search(
+        self,
+        query: str = None,
+        domain: str = None,
+        method: str = None,
+        limit: int = 50,
+        comment: str = None,
+    ):
+        return self.db.search(query, domain, method, limit, comment=comment)
+
+    def get_comment_histogram(self) -> List[Dict[str, Any]]:
+        return self.db.get_comment_histogram()
 
     def clear(self):
         self.db.clear()
