@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import logging
 import os
@@ -9,6 +10,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, parse_qsl
 import re
 import re2
+from anthropic import AsyncAnthropic
 
 import structlog
 
@@ -59,6 +61,7 @@ class MitmController:
         self.session_variables = {}
         self.dump_file = dump_file
         self.cli_upstream_proxy: Optional[str] = None
+        self.dynamic_addons: Dict[str, Any] = {}
 
     def _get_verify_param(self, verify_override: Optional[bool] = None) -> Any:
         if verify_override is not None:
@@ -257,6 +260,176 @@ async def stop_proxy() -> str:
 
 
 @mcp.tool()
+async def get_upstream_command(
+    listen_port: int = 8085,
+    upstream_host: str = "localhost",
+    ssl_insecure: bool = True,
+) -> str:
+    """
+    Return a mitmproxy CLI command that chains upstream to this MCP proxy instance.
+    Args:
+        listen_port: Port for the new mitmproxy instance to listen on (default 8085)
+        upstream_host: Host where the MCP proxy is running (default localhost)
+        ssl_insecure: Whether to add --ssl-insecure flag (default True)
+    """
+    upstream_url = f"http://{upstream_host}:{controller.port}"
+    cmd = f"mitmproxy --mode upstream:{upstream_url} --listen-port {listen_port}"
+    if ssl_insecure:
+        cmd += " --ssl-insecure"
+    return cmd
+
+
+@mcp.tool()
+async def run_dynamic_addon(description: str, addon_name: str = "dynamic_addon") -> str:
+    """
+    Generate and load a live mitmproxy addon from a natural language description.
+
+    Claude will write a Python addon class called DynamicAddon with any combination
+    of hook methods (request, response, tls_start_client, etc.), then hot-load it
+    into the running proxy so it takes effect immediately.
+
+    Args:
+        description: Natural language description of the desired proxy behaviour
+        addon_name: Logical name used to track / replace this addon (default: dynamic_addon)
+    """
+    if not controller.running or controller.master is None:
+        return json.dumps({"status": "error", "message": "Proxy is not running. Start it first."})
+
+    system_prompt = f"""You are an expert mitmproxy addon developer. Write a Python addon class
+called DynamicAddon that implements the described behaviour using mitmproxy hooks.
+
+Rules:
+- The class MUST be named exactly DynamicAddon.
+- Use only stdlib + mitmproxy imports. Do NOT import anthropic, mcp, or anything unavailable.
+- Available mitmproxy hooks (use only what you need):
+    request(self, flow: http.HTTPFlow)   — fires before the request is forwarded
+    response(self, flow: http.HTTPFlow)  — fires after the response arrives
+    tls_start_client(self, tls_handshake)
+    tls_start_server(self, tls_handshake)
+    connect(self, flow)
+    error(self, flow)
+- Modify headers via flow.request.headers[key] = value  or flow.response.headers[key] = value
+- Modify body via flow.request.text = "..."  or flow.response.text = "..."
+- Kill a flow with flow.kill()
+- Redirect via flow.request.url = "https://other.host/path"
+- Log with: import logging; logger = logging.getLogger("mcp_mitm"); logger.info(...)
+- Do NOT use print().
+- Return ONLY raw Python source code — no markdown fences, no commentary outside the class.
+
+IMPORTANT — flow tagging (MANDATORY):
+In EVERY hook that receives a flow argument (request, response, error, etc.) the FIRST line
+of the hook body must be:
+    flow.comment = "addon:{addon_name}"
+This tags the flow in the traffic database so the user can call get_addon_flows("{addon_name}")
+to see exactly which flows this addon generated or modified.
+
+Example skeleton:
+from mitmproxy import http
+import logging
+
+logger = logging.getLogger("mcp_mitm")
+
+class DynamicAddon:
+    def request(self, flow: http.HTTPFlow):
+        flow.comment = "addon:{addon_name}"
+        pass  # implement here
+
+    def response(self, flow: http.HTTPFlow):
+        flow.comment = "addon:{addon_name}"
+        pass  # implement here
+"""
+
+    client = AsyncAnthropic()
+    response = await client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=4096,
+        thinking={"type": "adaptive"},
+        system=system_prompt,
+        messages=[{"role": "user", "content": description}],
+    )
+
+    code = ""
+    for block in response.content:
+        if block.type == "text":
+            code = block.text.strip()
+            break
+
+    # Strip markdown fences if the model included them anyway
+    if code.startswith("```"):
+        lines = code.splitlines()
+        code = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+
+    # Syntax-check before exec
+    try:
+        ast.parse(code)
+    except SyntaxError as e:
+        return json.dumps({"status": "error", "message": f"Generated code has syntax error: {e}", "code": code})
+
+    namespace: Dict[str, Any] = {}
+    try:
+        exec(compile(code, "<dynamic_addon>", "exec"), namespace)
+    except Exception as e:
+        return json.dumps({"status": "error", "message": f"Error executing generated code: {e}", "code": code})
+
+    addon_class = namespace.get("DynamicAddon")
+    if addon_class is None:
+        return json.dumps({"status": "error", "message": "Generated code does not define a class named DynamicAddon.", "code": code})
+
+    try:
+        instance = addon_class()
+    except Exception as e:
+        return json.dumps({"status": "error", "message": f"Failed to instantiate DynamicAddon: {e}", "code": code})
+
+    # Remove existing addon with this name if present
+    existing = controller.dynamic_addons.get(addon_name)
+    if existing is not None:
+        try:
+            controller.master.addons.remove(existing)
+        except Exception:
+            pass
+
+    controller.master.addons.add(instance)
+    controller.dynamic_addons[addon_name] = instance
+
+    return json.dumps({
+        "status": "success",
+        "addon_name": addon_name,
+        "message": f"Addon '{addon_name}' is now live in the proxy.",
+        "code": code,
+    }, indent=2)
+
+
+@mcp.tool()
+async def list_dynamic_addons() -> str:
+    """List all currently loaded dynamic addons."""
+    if not controller.dynamic_addons:
+        return json.dumps({"addons": [], "message": "No dynamic addons loaded."})
+    return json.dumps({"addons": list(controller.dynamic_addons.keys())}, indent=2)
+
+
+@mcp.tool()
+async def remove_dynamic_addon(addon_name: str) -> str:
+    """
+    Remove a previously loaded dynamic addon by name.
+
+    Args:
+        addon_name: The name used when the addon was created via run_dynamic_addon
+    """
+    instance = controller.dynamic_addons.get(addon_name)
+    if instance is None:
+        return json.dumps({"status": "error", "message": f"No addon named '{addon_name}' found."})
+
+    if controller.master is not None:
+        try:
+            controller.master.addons.remove(instance)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": f"Failed to remove addon from proxy: {e}"})
+
+    del controller.dynamic_addons[addon_name]
+    return json.dumps({"status": "success", "message": f"Addon '{addon_name}' removed."})
+
+
+@mcp.tool()
 async def set_scope(allowed_domains: List[str]) -> str:
     controller.scope_manager.update_domains(allowed_domains)
     if allowed_domains:
@@ -442,15 +615,16 @@ async def load_traffic_file(
         [d.strip() for d in scope.split(",") if d.strip()] if scope else None
     )
 
-    # Security: Prevent path traversal and restrict to working directory
+    # Security: Prevent path traversal via relative '..' components.
+    # Absolute paths are allowed so users can load exported flows from any location.
     try:
-        requested_path = Path(file_path).resolve()
-        base_dir = Path.cwd().resolve()
-        if not str(requested_path).startswith(str(base_dir)):
+        input_path = Path(file_path)
+        if not input_path.is_absolute() and ".." in input_path.parts:
             return json.dumps({
                 "status": "error",
-                "message": f"Security Error: Access denied to {file_path}. Path must be within the project directory."
+                "message": f"Security Error: Path traversal not allowed in '{file_path}'. Use an absolute path.",
             })
+        requested_path = input_path.resolve()
     except Exception as e:
         return json.dumps({"status": "error", "message": f"Invalid path: {str(e)}"})
 
@@ -525,6 +699,7 @@ async def search_traffic(
     domain: str = None,
     method: str = None,
     limit: int = 50,
+    tag: str = None,
 ) -> str:
     """
     Search captured traffic using filters.
@@ -533,9 +708,43 @@ async def search_traffic(
         domain: Filter by domain name
         method: Filter by HTTP method (GET, POST, etc.)
         limit: Max results to return
+        tag: Filter by flow comment/tag (e.g. 'addon:my_fuzzer' to see addon-generated flows)
     """
-    results = controller.recorder.search(query, domain, method, limit)
+    results = controller.recorder.search(query, domain, method, limit, comment=tag)
     return json.dumps(results, indent=2)
+
+
+@mcp.tool()
+async def get_addon_flows(addon_name: str, limit: int = 200) -> str:
+    """
+    Return all flows tagged by a specific dynamic addon.
+
+    Every flow touched or generated by a dynamic addon is tagged with
+    'addon:<addon_name>' in its comment field. This tool filters by that tag.
+
+    Args:
+        addon_name: The name used when the addon was created via run_dynamic_addon
+        limit: Max flows to return (default 200)
+    """
+    results = controller.recorder.search(comment=f"addon:{addon_name}", limit=limit)
+    if not results:
+        return json.dumps({"addon_name": addon_name, "flows": [], "message": "No flows found for this addon yet."})
+    return json.dumps({"addon_name": addon_name, "count": len(results), "flows": results}, indent=2)
+
+
+@mcp.tool()
+async def get_flow_tag_histogram() -> str:
+    """
+    Return a histogram of flow comment tags, sorted by count descending.
+
+    Shows how many flows each dynamic addon (or any other comment) has tagged.
+    Example output:
+      [{"comment": "addon:sql_fuzzer", "count": 42}, {"comment": "addon:probe_v2", "count": 7}]
+    """
+    rows = controller.recorder.get_comment_histogram()
+    if not rows:
+        return json.dumps({"message": "No tagged flows found.", "histogram": []})
+    return json.dumps({"histogram": rows}, indent=2)
 
 
 @mcp.tool()
