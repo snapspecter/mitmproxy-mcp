@@ -42,11 +42,16 @@ def test_unsupported_regex_does_not_add_rule():
 
 @pytest.mark.asyncio
 async def test_add_interception_rule_reports_unsupported_regex():
-    result = await add_interception_rule(
-        rule_id="lookahead_api_test",
-        action_type="block",
-        url_pattern=r"foo(?=bar)",
-    )
+    original_scope = list(controller.scope_config.allowed_domains)
+    controller.scope_manager.update_domains(["example.com"])
+    try:
+        result = await add_interception_rule(
+            rule_id="lookahead_api_test",
+            action_type="block",
+            url_pattern=r"foo(?=bar)",
+        )
+    finally:
+        controller.scope_config.allowed_domains = original_scope
 
     assert result == "Invalid or unsupported regex for rule 'lookahead_api_test'"
 

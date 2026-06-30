@@ -487,9 +487,9 @@ class TrafficDB:
 class TrafficRecorder:
     """Captures flows into SQLite for inspection."""
 
-    def __init__(self, scope: ScopeManager):
+    def __init__(self, scope: ScopeManager, db_path: str = "mitm_mcp_traffic.db"):
         self.scope = scope
-        self.db = TrafficDB()
+        self.db = TrafficDB(db_path)
         # Keep a small in-memory deque of objects for legacy usage (like replay)
         # Note: This buffer is non-persistent, SQLite is the main storage.
         self.flows = deque(maxlen=500)

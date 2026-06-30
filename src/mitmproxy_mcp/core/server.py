@@ -46,14 +46,57 @@ logging.basicConfig(
 logger = structlog.get_logger()
 
 
+def _data_dir() -> Path:
+    configured = os.environ.get("MITMPROXY_MCP_DATA_DIR")
+    path = Path(configured) if configured else Path.cwd() / "mitmproxy-data"
+    path = path.expanduser().resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _safe_data_path(file_path: str, allow_append: bool = False) -> str:
+    append = allow_append and file_path.startswith("+")
+    raw_path = file_path[1:] if append else file_path
+    if not raw_path:
+        raise ValueError("A file name is required")
+
+    base_dir = _data_dir()
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = base_dir / candidate
+    candidate = candidate.resolve()
+    try:
+        candidate.relative_to(base_dir)
+    except ValueError as exc:
+        raise ValueError(f"Path must stay inside {base_dir}") from exc
+
+    return ("+" if append else "") + str(candidate)
+
+
+def _validate_upstream_proxy(proxy_url: str) -> str:
+    parsed = urlparse(proxy_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Upstream proxy must be an http:// or https:// URL")
+    return proxy_url
+
+
+def _require_scope() -> Optional[str]:
+    if controller.scope_manager.has_scope():
+        return None
+    return "No active scope. Call set_scope with at least one authorized domain first."
+
+
 class MitmController:
     def __init__(self, dump_file: Optional[str] = None):
         self.master: Optional[DumpMaster] = None
         self.proxy_task: Optional[asyncio.Task] = None
         self.scope_config = ScopeConfig()
         self.scope_manager = ScopeManager(self.scope_config)
-        self.recorder = TrafficRecorder(self.scope_manager)
-        self.interceptor = TrafficInterceptor()
+        self.recorder = TrafficRecorder(
+            self.scope_manager,
+            db_path=str(_data_dir() / "mitm_mcp_traffic.db"),
+        )
+        self.interceptor = TrafficInterceptor(self.scope_manager)
         self.running = False
         self.port = 8080
         self.session_variables = {}
@@ -79,14 +122,24 @@ class MitmController:
     ):
         if self.running:
             return "MITM is already running."
+        if not self.scope_manager.has_scope():
+            raise ValueError("Set at least one authorized scope domain before starting the proxy")
+        if not 1 <= port <= 65535:
+            raise ValueError("Port must be between 1 and 65535")
 
         self.port = port
         opts = options.Options(listen_host=host, listen_port=port)
 
         up_proxy = upstream_proxy or self.cli_upstream_proxy
         if up_proxy:
+            up_proxy = _validate_upstream_proxy(up_proxy)
             opts.update(mode=f"upstream:{up_proxy}")
-            logger.info("upstream_proxy_configured", url=up_proxy)
+            parsed_proxy = urlparse(up_proxy)
+            logger.info(
+                "upstream_proxy_configured",
+                host=parsed_proxy.hostname,
+                port=parsed_proxy.port,
+            )
 
         self.master = DumpMaster(
             opts,
@@ -98,6 +151,7 @@ class MitmController:
 
         save_path = dump_file or self.dump_file
         if save_path:
+            save_path = _safe_data_path(save_path, allow_append=True)
             opts.update(save_stream_file=save_path)
             logger.info("flow_dump_enabled", path=save_path)
 
@@ -161,6 +215,11 @@ class MitmController:
 
         original_request = flow_data["request"]
         target_url = original_request["url"]
+        target_host = urlparse(target_url).hostname or ""
+        if not self.scope_manager.is_host_allowed(target_host):
+            return "Replay blocked: the captured target is outside the active scope."
+        if not self.running:
+            return "Replay blocked: start the scoped proxy first."
         target_method = method if method else original_request["method"]
 
         target_headers = dict(original_request["headers"])
@@ -242,6 +301,9 @@ async def start_proxy(
             Prefix with + to append to an existing file.
         upstream_proxy: Optional upstream proxy URL (e.g., 'http://user:pass@proxy:port').
     """
+    scope_error = _require_scope()
+    if scope_error:
+        return scope_error
     try:
         return await controller.start(
             port=port, dump_file=dump_file, upstream_proxy=upstream_proxy
@@ -258,16 +320,21 @@ async def stop_proxy() -> str:
 
 @mcp.tool()
 async def set_scope(allowed_domains: List[str]) -> str:
-    controller.scope_manager.update_domains(allowed_domains)
-    if allowed_domains:
-        domains_str = ", ".join(allowed_domains)
-    else:
-        domains_str = "everything"
-    return f"Updated. Now tracking: {domains_str}"
+    try:
+        controller.scope_manager.update_domains(allowed_domains)
+    except ValueError as exc:
+        return f"Invalid scope: {exc}"
+    if not controller.scope_manager.has_scope():
+        return "Scope cleared. Capture and active traffic tools are disabled."
+    domains_str = ", ".join(controller.scope_config.allowed_domains)
+    return f"Updated. Now tracking exact domains and subdomains of: {domains_str}"
 
 
 @mcp.tool()
 async def set_global_header(key: str, value: str) -> str:
+    scope_error = _require_scope()
+    if scope_error:
+        return scope_error
     rule_id = f"global_{key.lower()}"
     rule = InterceptionRule(
         id=rule_id,
@@ -442,17 +509,15 @@ async def load_traffic_file(
         [d.strip() for d in scope.split(",") if d.strip()] if scope else None
     )
 
-    # Security: Prevent path traversal and restrict to working directory
     try:
-        requested_path = Path(file_path).resolve()
-        base_dir = Path.cwd().resolve()
-        if not str(requested_path).startswith(str(base_dir)):
-            return json.dumps({
-                "status": "error",
-                "message": f"Security Error: Access denied to {file_path}. Path must be within the project directory."
-            })
+        requested_path = Path(_safe_data_path(file_path))
     except Exception as e:
-        return json.dumps({"status": "error", "message": f"Invalid path: {str(e)}"})
+        return json.dumps(
+            {
+                "status": "error",
+                "message": f"Security Error: Access denied to {file_path}: {str(e)}",
+            }
+        )
 
     try:
         stats = await asyncio.to_thread(
@@ -586,8 +651,10 @@ def _resolve_template(template_str: str, variables: dict) -> str:
 
 
 @mcp.tool()
-async def clear_traffic() -> str:
+async def clear_traffic(confirm: bool = False) -> str:
     """Clear all captured traffic from the database."""
+    if not confirm:
+        return "Not cleared. Call clear_traffic with confirm=true to delete captured traffic."
     controller.recorder.clear()
     return "Cleared all traffic history."
 
@@ -610,6 +677,12 @@ async def fuzz_endpoint(
         payload_category: The category of payloads
         ('sqli', 'xss', 'path_traversal').
     """
+    scope_error = _require_scope()
+    if scope_error:
+        return scope_error
+    if not controller.running:
+        return "Fuzzing blocked: start the scoped proxy first."
+
     flow_data = controller.recorder.get_flow_detail(flow_id)
     if not flow_data:
         return "No matching flow."
@@ -639,6 +712,9 @@ async def fuzz_endpoint(
 
     original_request = flow_data["request"]
     base_url = original_request["url"]
+    target_host = urlparse(base_url).hostname or ""
+    if not controller.scope_manager.is_host_allowed(target_host):
+        return "Fuzzing blocked: the captured target is outside the active scope."
     method = original_request["method"]
 
     target_headers = dict(original_request["headers"])
@@ -837,6 +913,9 @@ async def add_interception_rule(
     search_pattern: str = None,
     phase: str = "request",
 ) -> str:
+    scope_error = _require_scope()
+    if scope_error:
+        return scope_error
     if phase not in ["request", "response"]:
         return "Phase needs to be either 'request' or 'response'"
 

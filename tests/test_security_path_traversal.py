@@ -1,47 +1,57 @@
-import pytest
-import os
 import json
-import asyncio
 from pathlib import Path
-from mitmproxy_mcp.core.server import load_traffic_file
+
+import pytest
+
+from mitmproxy_mcp.core.server import _safe_data_path, load_traffic_file
+
 
 @pytest.mark.asyncio
-async def test_path_traversal_denied():
-    """Verify that accessing files outside the project root is blocked."""
-    # Create a dummy file in /tmp
-    target_path = Path("/tmp/mitm_traversal_test.har")
-    with open(target_path, "w") as f:
-        f.write('{"log": {"entries": []}}')
-    
-    try:
-        # Attempt to access it via relative traversal
-        # We know we are in /home/snap/Development/mitmproxy-mcp/tests or similar
-        result_str = await load_traffic_file("../../../../../tmp/mitm_traversal_test.har")
-        result = json.loads(result_str)
-        
-        assert result["status"] == "error"
-        assert "Security Error" in result["message"]
-        assert "Access denied" in result["message"]
-        
-    finally:
-        if target_path.exists():
-            os.remove(target_path)
+async def test_path_traversal_denied(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.har"
+    outside.write_text('{"log": {"entries": []}}', encoding="utf-8")
+    monkeypatch.setenv("MITMPROXY_MCP_DATA_DIR", str(workspace))
+
+    result = json.loads(await load_traffic_file(str(outside)))
+
+    assert result["status"] == "error"
+    assert "Security Error" in result["message"]
+
 
 @pytest.mark.asyncio
-async def test_valid_path_allowed(tmp_path):
-    """Verify that accessing files within the project root still works."""
-    # Create a file inside the project (using tmp_path which pytest handles)
-    # However, our fix restricts to CWD, so let's create it in the current dir
-    local_file = Path("test_safe_import.har")
-    with open(local_file, "w") as f:
-        f.write('{"log": {"entries": []}}')
-        
-    try:
-        result_str = await load_traffic_file("test_safe_import.har")
-        result = json.loads(result_str)
-        
-        # Should NOT be a security error
-        assert result["status"] == "ok"
-    finally:
-        if local_file.exists():
-            os.remove(local_file)
+async def test_prefix_collision_path_denied(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sibling = tmp_path / "workspace-escape"
+    sibling.mkdir()
+    outside = sibling / "traffic.har"
+    outside.write_text('{"log": {"entries": []}}', encoding="utf-8")
+    monkeypatch.setenv("MITMPROXY_MCP_DATA_DIR", str(workspace))
+
+    result = json.loads(await load_traffic_file(str(outside)))
+
+    assert result["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_valid_workspace_path_allowed(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    local_file = workspace / "safe.har"
+    local_file.write_text('{"log": {"entries": []}}', encoding="utf-8")
+    monkeypatch.setenv("MITMPROXY_MCP_DATA_DIR", str(workspace))
+
+    result = json.loads(await load_traffic_file("safe.har"))
+
+    assert result["status"] == "ok"
+
+
+def test_dump_path_is_confined(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    monkeypatch.setenv("MITMPROXY_MCP_DATA_DIR", str(workspace))
+
+    assert Path(_safe_data_path("capture.flow")).parent == workspace.resolve()
+    with pytest.raises(ValueError):
+        _safe_data_path("../capture.flow")

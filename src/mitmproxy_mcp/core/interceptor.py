@@ -3,6 +3,7 @@ from typing import Any, Dict
 import re2
 from mitmproxy import http
 from ..models import InterceptionRule
+from .scope import ScopeManager
 from .utils import get_safe_text
 
 logger = logging.getLogger("mcp_mitm")
@@ -11,9 +12,10 @@ logger = logging.getLogger("mcp_mitm")
 class TrafficInterceptor:
     """Applies dynamic rules to modify traffic on the fly."""
 
-    def __init__(self):
+    def __init__(self, scope: ScopeManager | None = None):
         self.rules: Dict[str, InterceptionRule] = {}
         self._compiled_patterns: Dict[str, Dict[str, Any]] = {}
+        self.scope = scope
 
     def add_rule(self, rule: InterceptionRule) -> bool:
         patterns = {}
@@ -51,6 +53,9 @@ class TrafficInterceptor:
         self._apply_rules(flow, "response")
 
     def _apply_rules(self, flow: http.HTTPFlow, phase: str):
+        if self.scope and not self.scope.is_host_allowed(flow.request.host):
+            return
+
         message = getattr(flow, phase)
         if not message:
             return
