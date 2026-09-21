@@ -583,9 +583,9 @@ markupsafe==3.0.3 \
     #   flask
     #   jinja2
     #   werkzeug
-mcp==1.26.0 \
-    --hash=sha256:904a21c33c25aa98ddbeb47273033c435e595bbacfdb177f4bd87f6dceebe1ca \
-    --hash=sha256:db6e2ef491eecc1a0d93711a76f28dec2e05999f93afd48795da1c1137142c66
+mcp==2.2.0 \
+    --hash=sha256:2dc37ecb1974becdcebdbf7561e7c15a07dbbf20ba21ba16c3593b3038b3afbd \
+    --hash=sha256:bde982589473a060ae145e3406e9a5333fe538c97229ba841f5a7f92be004f81
     # via mitmproxy-mcp
 mitmproxy==12.2.3 \
     --hash=sha256:df75ccd15ccb39ab55ce9dd4130312270e8ba208eb927a7cbe50cb52678ec722
