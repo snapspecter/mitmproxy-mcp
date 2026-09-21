@@ -2,6 +2,20 @@ import pytest
 from types import SimpleNamespace
 
 from mitmproxy_mcp.core import server
+from mitmproxy_mcp.core.untrusted import (
+    UNTRUSTED_MARKER,
+    UNTRUSTED_END_MARKER,
+)
+
+
+def _unwrap_code(output: str) -> str:
+    """Strip the untrusted fence and return the generated code."""
+    assert output.startswith(UNTRUSTED_MARKER)
+    assert output.rstrip().endswith(UNTRUSTED_END_MARKER)
+    body = output[len(UNTRUSTED_MARKER):output.rindex(UNTRUSTED_END_MARKER)]
+    lines = body.splitlines()
+    # Drop the notice line (second line of the body).
+    return "\n".join(lines[2:])
 
 
 @pytest.mark.asyncio
@@ -115,11 +129,12 @@ async def test_generate_scraper_code_requests_framework(monkeypatch):
         lambda fid: SimpleNamespace(body=None),
     )
 
-    code = await server.generate_scraper_code(flow_id, target_framework="requests")
+    output = await server.generate_scraper_code(flow_id, target_framework="requests")
+    code = _unwrap_code(output)
 
     assert "import requests" in code
     assert "with requests.Session() as client:" in code
-    assert "client.verify = False" in code
+    assert "client.verify = True" in code
     assert "response_0 = client.request(" in code
     assert "timeout=30" in code
 
@@ -157,11 +172,12 @@ async def test_generate_scraper_code_aiohttp_framework(monkeypatch):
         lambda fid: SimpleNamespace(body="some_body"),
     )
 
-    code = await server.generate_scraper_code(flow_id, target_framework="aiohttp")
+    output = await server.generate_scraper_code(flow_id, target_framework="aiohttp")
+    code = _unwrap_code(output)
 
     assert "import aiohttp" in code
     assert "async with aiohttp.ClientSession" in code
-    assert "verify_ssl=False" in code
+    assert "verify_ssl=True" in code
     assert 'async with client.request("POST",' in code
     assert "data=data_0" in code
 
@@ -199,7 +215,8 @@ async def test_generate_scraper_code_playwright_framework(monkeypatch):
         lambda fid: SimpleNamespace(body=None),
     )
 
-    code = await server.generate_scraper_code(flow_id, target_framework="playwright")
+    output = await server.generate_scraper_code(flow_id, target_framework="playwright")
+    code = _unwrap_code(output)
 
     assert "from playwright.async_api import async_playwright" in code
     assert "browser = await p.chromium.launch(" in code
@@ -223,7 +240,8 @@ async def test_generate_scraper_code_playwright_framework(monkeypatch):
         "get_flow_detail",
         fake_get_flow_detail_api,
     )
-    code_api = await server.generate_scraper_code(flow_id, target_framework="playwright")
+    output_api = await server.generate_scraper_code(flow_id, target_framework="playwright")
+    code_api = _unwrap_code(output_api)
     # With an API call it should use context.request.fetch
     assert "response_0 = await context.request.fetch(" in code_api
 
@@ -264,7 +282,8 @@ async def test_generate_scraper_code_escapes_malicious_url(monkeypatch):
         lambda fid: None,
     )
 
-    code = await server.generate_scraper_code(flow_id)
+    output = await server.generate_scraper_code(flow_id)
+    code = _unwrap_code(output)
 
     # The generated code must be valid Python — compile() will raise
     # SyntaxError if the injected quotes broke out of a string literal.

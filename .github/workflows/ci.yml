@@ -82,7 +82,7 @@ jobs:
           --cov=mitmproxy_mcp
           --cov-report=term
           --cov-report=xml:coverage.xml
-          --cov-fail-under=35
+          --cov-fail-under=49
           -q
 
       - name: Upload coverage report

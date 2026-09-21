@@ -4,23 +4,46 @@ from typing import Any, Dict, List
 
 from jinja2 import Environment, FileSystemLoader, PackageLoader, TemplateNotFound
 
+from .untrusted import neutralise_markers
+
+# Headers that carry live credentials. They are replaced with a placeholder
+# before any code is generated, so captured secrets never reach the model or
+# the generated file.
+SENSITIVE_HEADERS = {
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "x-auth-token",
+}
+
+SUPPORTED_FRAMEWORKS = {"curl_cffi", "requests", "aiohttp", "playwright"}
+
+REDACTED = "<REDACTED>"
+
 
 def _try_load_template_environment() -> Environment:
     package_loader = None
     try:
         package_loader = PackageLoader("mitmproxy_mcp", "templates")
-    except Exception:
-        pass
+    except (ValueError, ImportError):
+        # Package templates unavailable (e.g. running from a source checkout);
+        # fall back to the filesystem loader below.
+        package_loader = None
 
     if package_loader is not None:
-        env = Environment(
+        # Templates emit Python source, not HTML. Autoescape would HTML-escape
+        # quotes and corrupt the generated code.
+        env = Environment(  # nosec B701
             loader=package_loader,
             trim_blocks=True,
             lstrip_blocks=True,
         )
     else:
         templates_path = Path(__file__).resolve().parent.parent / "templates"
-        env = Environment(
+        # See above: generated artefact is code, not markup.
+        env = Environment(  # nosec B701
             loader=FileSystemLoader(str(templates_path)),
             trim_blocks=True,
             lstrip_blocks=True,
@@ -69,27 +92,40 @@ def normalize_scraper_flows(flows: List[Dict[str, Any]], recorder: Any) -> List[
         headers.pop("Host", None)
         headers.pop("Content-Length", None)
         headers.pop("Content-Encoding", None)
+        for name in list(headers):
+            if name.lower() in SENSITIVE_HEADERS:
+                headers[name] = REDACTED
+            else:
+                # Captured values must not be able to forge the untrusted fence
+                # that wraps the generated code.
+                headers[name] = neutralise_markers(str(headers[name]))
 
         body = _get_best_request_body(flow, recorder)
+        if body is not None:
+            body = neutralise_markers(body)
 
         accept_header = headers.get("Accept") or headers.get("accept") or ""
         is_navigation = request.get("method", "").upper() == "GET" and "text/html" in str(accept_header)
 
+        method = neutralise_markers(str(request.get("method", "GET")))
+        url = neutralise_markers(str(request.get("url", "")))
         normalized_flows.append({
             "id": flow["id"],
-            "url": request.get("url", ""),
-            "method": request.get("method", "GET"),
+            "url": url,
+            "method": method,
             "headers": headers,
             "body": body,
             "has_body": bool(body),
             "is_navigation": is_navigation,
-            "url_preview": str(request.get("url", ""))[:50],
+            "url_preview": url[:50],
         })
 
     return normalized_flows
 
 
 def render_scraper_code(target_framework: str, flows: List[Dict[str, Any]]) -> str:
+    if target_framework not in SUPPORTED_FRAMEWORKS:
+        return f"Framework '{target_framework}' is not supported yet."
     env = _try_load_template_environment()
     try:
         template = env.get_template(f"{target_framework}.jinja2")

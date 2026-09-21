@@ -5,6 +5,13 @@ from types import SimpleNamespace
 from mitmproxy_mcp.core import server
 
 
+def _unwrap(payload: str) -> dict:
+    """Tool output is wrapped in an untrusted-data envelope; get the payload."""
+    data = json.loads(payload)
+    assert data["_trust"] == "untrusted"
+    return data["data"]
+
+
 @pytest.mark.asyncio
 async def test_get_flow_schema_json_object(monkeypatch):
     flow_id = "test-flow"
@@ -27,7 +34,7 @@ async def test_get_flow_schema_json_object(monkeypatch):
     )
 
     result = await server.get_flow_schema(flow_id)
-    schema = json.loads(result)
+    schema = _unwrap(result)
 
     expected = {
         "id": "int",
@@ -72,7 +79,7 @@ async def test_get_flow_schema_full_body_from_db(monkeypatch):
     )
 
     result = await server.get_flow_schema(flow_id)
-    schema = json.loads(result)
+    schema = _unwrap(result)
 
     expected = {
         "user_id": "int",

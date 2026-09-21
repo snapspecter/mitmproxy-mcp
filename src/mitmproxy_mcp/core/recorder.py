@@ -4,14 +4,30 @@ import shlex
 import sqlite3
 import sys
 from collections import deque
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from mitmproxy import http
 from mitmproxy.io import FlowReader
 
-from .scope import ScopeManager
+from .scope import ScopeManager, host_in_scope
 from .utils import get_safe_text
+
+# Headers whose values may carry live credentials. They are redacted before any
+# flow detail is handed back to a caller (and therefore to the model context).
+SENSITIVE_HEADERS = {
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "x-auth-token",
+}
+REDACTED = "<REDACTED>"
+
+ALLOWED_IMPORT_EXTENSIONS = (".har", ".mitm", ".flow")
 
 
 def _parse_headers(raw: str) -> Dict[str, str]:
@@ -60,6 +76,22 @@ class SimpleResponse:
         self.body = body
 
 
+def _redact_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    """Replace credential-bearing header values with a placeholder."""
+    return {
+        k: (REDACTED if k.lower() in SENSITIVE_HEADERS else v)
+        for k, v in headers.items()
+    }
+
+
+def _redact_headers_ordered(headers: List[List[str]]) -> List[List[str]]:
+    """Replace credential-bearing values in an ordered [key, value] list."""
+    return [
+        [k, (REDACTED if k.lower() in SENSITIVE_HEADERS else v)]
+        for k, v in headers
+    ]
+
+
 class TrafficDB:
     """Implements SQLite persistence for traffic logs."""
 
@@ -67,8 +99,17 @@ class TrafficDB:
         self.db_path = db_path
         self._init_db()
 
+    @contextmanager
     def _get_conn(self):
-        return sqlite3.connect(self.db_path, check_same_thread=False)
+        """Open a connection that is always closed, with WAL and a busy timeout."""
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self):
         with self._get_conn() as conn:
@@ -194,8 +235,12 @@ class TrafficDB:
             if not row:
                 return None
 
-            req_headers = _parse_headers(row["request_headers"])
-            resp_headers = _parse_headers(row["response_headers"]) if row["response_headers"] else None
+            req_headers = _redact_headers(_parse_headers(row["request_headers"]))
+            resp_headers = (
+                _redact_headers(_parse_headers(row["response_headers"]))
+                if row["response_headers"]
+                else None
+            )
 
             simple_request = SimpleRequest(
                 method=row["method"],
@@ -263,7 +308,10 @@ class TrafficDB:
             conn.execute("DELETE FROM flows")
 
     def get_all_for_analysis(
-        self, limit: Optional[int] = None, lightweight: bool = False
+        self,
+        limit: Optional[int] = None,
+        lightweight: bool = False,
+        redact: bool = True,
     ) -> List[Dict[str, Any]]:
         """Fetch flows for analysis.
 
@@ -271,13 +319,18 @@ class TrafficDB:
             limit: Max flows to return. None = all flows.
             lightweight: If True, only select columns needed for clustering
                 (no bodies). Reduces memory usage for large captures.
+            redact: Replace credential-bearing header values. Set False only
+                for in-process analysis that inspects the value but never
+                returns it (e.g. auth-scheme detection).
         """
         if lightweight:
             cols = "id, url, method, status_code, request_headers, response_headers"
         else:
             cols = "*"
 
-        sql = f"SELECT {cols} FROM flows ORDER BY timestamp DESC"
+        # cols is a fixed literal ("*" or a constant column list); values are
+        # always passed as bound parameters.
+        sql = "SELECT {} FROM flows ORDER BY timestamp DESC".format(cols)  # nosec B608
         params: list = []
         if limit is not None:
             sql += " LIMIT ?"
@@ -295,7 +348,11 @@ class TrafficDB:
                         "request": {
                             "url": row["url"],
                             "method": row["method"],
-                            "headers": _parse_headers(row["request_headers"]),
+                            "headers": (
+                                _redact_headers(_parse_headers(row["request_headers"]))
+                                if redact
+                                else _parse_headers(row["request_headers"])
+                            ),
                             **(
                                 {"body": row["request_body"]}
                                 if not lightweight
@@ -304,7 +361,11 @@ class TrafficDB:
                         },
                         "response": {
                             "status_code": row["status_code"],
-                            "headers": _parse_headers(row["response_headers"])
+                            "headers": (
+                                _redact_headers(_parse_headers(row["response_headers"]))
+                                if redact
+                                else _parse_headers(row["response_headers"])
+                            )
                             if row["response_headers"]
                             else {},
                             **(
@@ -351,13 +412,13 @@ class TrafficDB:
 
         placeholders = ",".join(["?"] * len(flow_ids))
         header_fn = _parse_headers_ordered if ordered_headers else _parse_headers
+        redact_fn = _redact_headers_ordered if ordered_headers else _redact_headers
 
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                f"SELECT {cols} FROM flows WHERE id IN ({placeholders})",
-                flow_ids,
-            )
+            # cols was validated against an allowlist above; ids are bound.
+            query = "SELECT {} FROM flows WHERE id IN ({})".format(cols, placeholders)  # nosec B608
+            cursor = conn.execute(query, flow_ids)
             rows = cursor.fetchall()
             row_keys = set(rows[0].keys()) if rows else set()
             results = []
@@ -370,7 +431,7 @@ class TrafficDB:
                 if "method" in row_keys:
                     req["method"] = row["method"]
                 if "request_headers" in row_keys and row["request_headers"]:
-                    req["headers"] = header_fn(row["request_headers"])
+                    req["headers"] = redact_fn(header_fn(row["request_headers"]))
                 if "request_body" in row_keys:
                     req["body"] = row["request_body"]
                 if req:
@@ -379,13 +440,56 @@ class TrafficDB:
                 if "status_code" in row_keys and row["status_code"] is not None:
                     resp: Dict[str, Any] = {"status_code": row["status_code"]}
                     if "response_headers" in row_keys and row["response_headers"]:
-                        resp["headers"] = header_fn(row["response_headers"])
+                        resp["headers"] = redact_fn(header_fn(row["response_headers"]))
                     if "response_body" in row_keys:
                         resp["body"] = row["response_body"]
                     entry["response"] = resp
 
                 results.append(entry)
             return results
+
+    IMPORT_PATH_ENV = "MITMPROXY_MCP_IMPORT_ROOT"
+    MAX_IMPORT_BYTES = 256 * 1024 * 1024
+
+    @staticmethod
+    def resolve_import_path(file_path: str) -> Path:
+        """Resolve and validate an import path.
+
+        Containment uses path-component semantics (never a string prefix), the
+        base directory is an explicit configured root (defaulting to the
+        project root, not the process CWD), the extension is checked up front,
+        and the file is opened with O_NOFOLLOW so a symlink cannot swap the
+        target between validation and read.
+        """
+        base = Path(
+            os.environ.get(
+                TrafficDB.IMPORT_PATH_ENV,
+                Path(__file__).resolve().parents[3],
+            )
+        ).resolve()
+        candidate = Path(file_path).resolve()
+        try:
+            candidate.relative_to(base)
+        except ValueError as err:
+            raise PermissionError(
+                f"path must be within the import root ({base})"
+            ) from err
+        if candidate.is_symlink():
+            raise PermissionError("symlinked import paths are not allowed")
+        if not candidate.exists():
+            raise FileNotFoundError(f"file not found: {file_path}")
+        if not candidate.is_file():
+            raise ValueError(f"path is not a file: {file_path}")
+        if candidate.suffix.lower() not in ALLOWED_IMPORT_EXTENSIONS:
+            raise ValueError(
+                f"unsupported file extension: {candidate.suffix or '(none)'}"
+            )
+        size = candidate.stat().st_size
+        if size > TrafficDB.MAX_IMPORT_BYTES:
+            raise ValueError(
+                f"file exceeds the {TrafficDB.MAX_IMPORT_BYTES} byte import limit"
+            )
+        return candidate
 
     def import_from_file(
         self,
@@ -395,53 +499,45 @@ class TrafficDB:
     ) -> Dict[str, Any]:
         """Import flows from a HAR or mitmproxy flow file.
 
-        Uses mitmproxy's FlowReader which auto-detects format (HAR if JSON,
-        native tnetstring otherwise).
-
-        Args:
-            file_path: Path to .har or .mitm/.flow file.
-            append: If False, clear existing traffic before import.
-            scope: Optional list of domains to filter by during import.
-
-        Returns:
-            Dict with import stats: {"imported": int, "skipped": int, "errors": int}
+        The whole file is parsed into memory first. Nothing is cleared until
+        parsing succeeds, so a corrupt or truncated file can never destroy
+        existing traffic.
         """
-        if not append:
-            self.clear()
+        resolved = self.resolve_import_path(file_path)
 
         stats = {"imported": 0, "skipped": 0, "errors": 0}
 
-        if not os.path.exists(file_path):
-            print(f"File not found: {file_path}", file=sys.stderr)
-            return stats
-
-        allowed_exts = ('.har', '.mitm', '.flow')
-        if not any(str(file_path).lower().endswith(ext) for ext in allowed_exts):
-            print(f"Unsupported file extension: {file_path}", file=sys.stderr)
-            return stats
-
-        with open(file_path, "rb") as f:
+        # Open with O_NOFOLLOW and parse fully before touching the database.
+        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as f:
             reader = FlowReader(f)
+            staged: List[http.HTTPFlow] = []
             for flow in reader.stream():
                 try:
                     if not isinstance(flow, http.HTTPFlow):
                         stats["skipped"] += 1
                         continue
-
-                    if scope:
-                        host = urlparse(flow.request.url).hostname or ""
-                        if not any(host == d or host.endswith("." + d) for d in scope):
-                            stats["skipped"] += 1
-                            continue
-
-                    self.save_flow(flow)
-                    stats["imported"] += 1
+                    staged.append(flow)
                 except Exception as e:
                     stats["errors"] += 1
-                    print(
-                        f"Skipped flow during import: {e}",
-                        file=sys.stderr,
-                    )
+                    print(f"Skipped flow during import: {e}", file=sys.stderr)
+
+        # Parse succeeded: only now is it safe to replace existing traffic.
+        if not append:
+            self.clear()
+
+        for flow in staged:
+            try:
+                if scope:
+                    host = urlparse(flow.request.url).hostname or ""
+                    if not host_in_scope(host, scope):
+                        stats["skipped"] += 1
+                        continue
+                self.save_flow(flow)
+                stats["imported"] += 1
+            except Exception as e:
+                stats["errors"] += 1
+                print(f"Failed to store imported flow: {e}", file=sys.stderr)
 
         return stats
 
@@ -451,6 +547,8 @@ class TrafficDB:
             cmd.append(shlex.quote(request.url))
 
             for key, value in request.headers.items():
+                if key.lower() in SENSITIVE_HEADERS:
+                    value = REDACTED
                 cmd.append("-H")
                 cmd.append(shlex.quote(f"{key}: {value}"))
 

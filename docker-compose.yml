@@ -1,8 +1,11 @@
 services:
   server:
     build: .
+    # Bind to loopback only. The proxy intercepts and rewrites traffic; it must
+    # not be reachable from the network by default. Use "8080:8080" only with a
+    # deliberate, documented decision.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       # Ensure python output is sent straight to terminal (e.g. valid for standard docker logs)
       - PYTHONUNBUFFERED=1
@@ -10,8 +13,11 @@ services:
       # Mount the source code for easier development/debugging without rebuilding
       - ./src:/app/src
     restart: unless-stopped
+    # The proxy speaks the HTTP proxy protocol, not an HTTP API, so there is no
+    # /health endpoint. Check that the port accepts a TCP connection instead.
     healthcheck:
-      test: [ "CMD-SHELL", "curl -f http://localhost:8080/health || exit 1" ] # Note: mitmproxy might not have a /health endpoint exposed by default, but this is a placeholder or we can use a TCP check
+      test: [ "CMD-SHELL", "python -c \"import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(0 if s.connect_ex(('127.0.0.1',8080))==0 else 1)\"" ]
       interval: 30s
       timeout: 10s
       retries: 3
+
