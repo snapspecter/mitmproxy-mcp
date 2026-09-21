@@ -1072,9 +1072,9 @@ typing-inspection==0.4.4 \
     #   mcp
     #   pydantic
     #   pydantic-settings
-urwid==3.0.3 \
-    --hash=sha256:300804dd568cda5aa1c5b204227bd0cfe7a62cef2d00987c5eb2e4e64294ed9b \
-    --hash=sha256:ede36ecc99a293bbb4b5e5072c7b7bb943eb3bed17decf89b808209ed2dead15
+urwid==4.1.4 \
+    --hash=sha256:4b31e19acc1a7709a08f90bf8e05895006696470f03c7dc919dd77e0174ff1a4 \
+    --hash=sha256:e6d6b5d977fc296b161934ca60572532f507b27aea2c65b389efb1ebfd2ebee7
     # via mitmproxy
 uvicorn==0.53.0 \
     --hash=sha256:a9356f0cb89b3b8621529c5d5eebd69bfe154f4c3f68b4cf2de47e45fa855c2e \
