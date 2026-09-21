@@ -23,7 +23,10 @@ ENV/
 # Testing
 .pytest_cache/
 .coverage
+coverage.xml
 htmlcov/
+dist/
+build/
 
 # Linting
 .ruff_cache/
