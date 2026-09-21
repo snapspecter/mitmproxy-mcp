@@ -1,6 +1,10 @@
 version: 2
 updates:
-  - package-ecosystem: "pip"
+  # The project resolves with uv; uv.lock is the source of truth. The `pip`
+  # ecosystem only maintains requirements.txt, which is a generated
+  # (`uv export`) artefact nobody consumes, so it produced a stream of PRs
+  # against a derived file that drifted from the lock.
+  - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "weekly"
