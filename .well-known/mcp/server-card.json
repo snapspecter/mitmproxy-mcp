@@ -1,7 +1,7 @@
 {
   "mcpVersion": "1.0",
   "name": "mitmproxy-mcp",
-  "version": "0.2.0",
+  "version": "0.6.1",
   "description": "Advanced network interception and debugging for AI agents.",
   "capabilities": {
     "tools": true,
@@ -9,6 +9,7 @@
   },
   "appliesTo": ["local"],
   "auth": {
-    "type": "none"
+    "type": "none",
+    "note": "Local stdio only. The MCP transport is stdio and the proxy binds loopback by default. Exposing this server over a network transport requires adding authentication and TLS; do not publish it as-is."
   }
 }

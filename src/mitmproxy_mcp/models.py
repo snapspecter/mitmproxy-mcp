@@ -1,5 +1,7 @@
 from typing import Dict, List, Optional, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from .core.sanitize import is_safe_header_name, is_safe_header_value
 
 
 class InterceptionRule(BaseModel):
@@ -23,6 +25,24 @@ class InterceptionRule(BaseModel):
     search_pattern: Optional[str] = None
 
     model_config = {"extra": "ignore"}
+
+    @field_validator("key")
+    @classmethod
+    def _validate_key(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not is_safe_header_name(v):
+            raise ValueError(f"invalid header name: {v!r}")
+        return v
+
+    @field_validator("value")
+    @classmethod
+    def _validate_value(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not is_safe_header_value(v):
+            raise ValueError("header value contains CR/LF/NUL")
+        return v
 
 
 class ScopeConfig(BaseModel):

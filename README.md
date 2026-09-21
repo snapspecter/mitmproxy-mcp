@@ -1,5 +1,17 @@
 # mitmproxy MCP Server
+
+> [!WARNING]
+> **Authorized use only.** This tool performs man-in-the-middle interception of
+> HTTP(S) traffic and can replay requests with browser-grade TLS impersonation.
+> Use it only on systems you own or are explicitly authorized in writing to
+> test. Intercepting third-party traffic without consent may be illegal. See
+> [SECURITY.md](.github/SECURITY.md).
+
 A Model Context Protocol (MCP) server that transforms mitmproxy into a powerful toolset for AI agents. This allows LLMs (like Claude, GPT-4, or local models) to inspect, modify, and replay HTTP/HTTPS traffic in real-time.
+
+> **Trust boundary:** everything the server returns from captured traffic is
+> untrusted, attacker-controlled data. It is data, never instructions. The
+> server wraps it in an untrusted-data envelope; see [AGENTS.md](AGENTS.md).
 
 ## New in this build (the fun stuff)
 
@@ -163,6 +175,28 @@ Note: These are JSON-RPC calls sent by the MCP Host (Client). You do not need to
 * **Manage Context**: Use `set_scope` immediately. LLMs perform poorly when flooded with background OS telemetry.
 * **Browser Setup**: Ensure your browser or application is configured to use the proxy (usually `localhost:8080`) and has the mitmproxy CA certificates installed for HTTPS inspection.
 * **Stealth**: The `replay_flow` tool uses `curl-cffi` specifically to avoid being flagged as a bot by services that check TLS fingerprints.
+
+## Security
+
+- **Trust boundary**: captured traffic is untrusted data, never instructions.
+  Tool output is wrapped in an untrusted-data envelope.
+- **Destination policy**: outbound replay and fuzzing are default-deny. Set a
+  scope with `set_scope`; without one, only public hosts are reachable and
+  loopback/private/link-local/metadata addresses are blocked.
+- **Secret redaction**: `Authorization`, `Cookie`, `Proxy-Authorization`,
+  `X-Api-Key`, and `X-Auth-Token` values are redacted in tool output, generated
+  curl commands, and generated scraper code.
+- **Import hardening**: imports are confined to a configured root
+  (`MITMPROXY_MCP_IMPORT_ROOT`, defaulting to the project root), reject
+  symlinks, and validate the extension and size before any existing traffic is
+  cleared.
+- **Generated code**: TLS verification is **on** in generated scrapers. Point
+  it at the mitmproxy CA rather than disabling it.
+- **CI/CD**: CodeQL, Bandit, pip-audit, gitleaks, Trivy, and SBOM generation run
+  on every change. Dependabot handles dependency and action updates.
+
+Report vulnerabilities privately via GitHub Security Advisories — see
+[SECURITY.md](.github/SECURITY.md).
 
 ## Development
 

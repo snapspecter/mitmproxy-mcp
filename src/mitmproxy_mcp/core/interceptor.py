@@ -3,6 +3,7 @@ from typing import Any, Dict
 import re2
 from mitmproxy import http
 from ..models import InterceptionRule
+from .sanitize import validate_header
 from .utils import get_safe_text
 
 logger = logging.getLogger("mcp_mitm")
@@ -16,6 +17,14 @@ class TrafficInterceptor:
         self._compiled_patterns: Dict[str, Dict[str, Any]] = {}
 
     def add_rule(self, rule: InterceptionRule) -> bool:
+        # Defence in depth: the model validates, but this layer is the last
+        # gate before values reach mitmproxy's header table.
+        if rule.action_type == "inject_header":
+            error = validate_header(rule.key or "", rule.value or "")
+            if error:
+                logger.warning("Rejected rule %s: %s", rule.id, error)
+                return False
+
         patterns = {}
         try:
             if rule.url_pattern:

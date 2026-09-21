@@ -3,6 +3,21 @@ from typing import List
 from ..models import ScopeConfig
 
 
+def host_in_scope(host: str, allowed_domains: List[str]) -> bool:
+    """Exact host or true subdomain match.
+
+    Never a substring match: an allowlist entry of ``example.com`` must not
+    match ``example.com.attacker.net``.
+    """
+    host = (host or "").lower().rstrip(".")
+    if not host:
+        return False
+    return any(
+        host == d.lower().rstrip(".") or host.endswith("." + d.lower().rstrip("."))
+        for d in allowed_domains
+    )
+
+
 class ScopeManager:
     """Filters traffic to prevent noise in the LLM context window."""
 
@@ -11,8 +26,7 @@ class ScopeManager:
 
     def is_allowed(self, flow: http.HTTPFlow) -> bool:
         if self.config.allowed_domains:
-            host = flow.request.host
-            if not any(d in host for d in self.config.allowed_domains):
+            if not host_in_scope(flow.request.host, self.config.allowed_domains):
                 return False
 
         path = flow.request.path.lower().split("?")[0]

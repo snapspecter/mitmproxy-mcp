@@ -1,0 +1,32 @@
+# Accepted-risk advisories for pip-audit.
+#
+# One advisory ID per line. Blank lines and lines starting with '#' are ignored.
+# The security workflow turns each ID into a `--ignore-vuln` flag.
+#
+# RULE: an entry may only be added when the fixed version cannot be selected
+# within the current dependency graph. Every entry must name the blocking
+# upstream pin and why the vulnerable code path is unreachable here.
+# Re-check on every mitmproxy upgrade.
+
+# --- Blocked by mitmproxy's own pins (mitmproxy 12.x) ----------------------
+# Verified from installed metadata:
+#   cryptography<=48.1  (fixed: 49.0.0 / 50.0.0)
+#   h2==4.3.0           (fixed: 4.4.1)
+#   msgpack<=1.1.2      (fixed: 1.2.1)
+#   tornado<=6.5.5      (fixed: 6.5.7 / 6.5.8)
+# These are hard upper bounds in mitmproxy itself, so the fixed releases cannot
+# be selected without forking it. This server runs no Tornado HTTP server and
+# its outbound requests use curl_cffi, not SimpleAsyncHTTPClient; h2/msgpack are
+# used inside mitmproxy's own connection handling.
+GHSA-8423-8fgw-73vq
+GHSA-pw6j-qg29-8w7f
+GHSA-wwv5-g3v4-889x
+PYSEC-2026-3387
+PYSEC-2026-3388
+PYSEC-2026-3389
+PYSEC-2026-3928
+PYSEC-2026-3552
+PYSEC-2026-3553
+PYSEC-2026-3554
+PYSEC-2026-3628
+PYSEC-2026-3625

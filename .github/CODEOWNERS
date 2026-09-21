@@ -1,0 +1,9 @@
+# Security-sensitive surfaces require review by the maintainer.
+.github/workflows/   @dandgabr
+.github/SECURITY.md  @dandgabr
+.github/dependabot.yml @dandgabr
+.github/security/    @dandgabr
+src/mitmproxy_mcp/core/netpolicy.py  @dandgabr
+src/mitmproxy_mcp/core/sanitize.py   @dandgabr
+src/mitmproxy_mcp/core/untrusted.py  @dandgabr
+Dockerfile            @dandgabr
