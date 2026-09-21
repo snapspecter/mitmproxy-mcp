@@ -48,7 +48,8 @@ jobs:
 
       - name: Run Bandit
         run: >
-          uv run bandit
+          uv run --with bandit-sarif-formatter
+          bandit
           -c pyproject.toml
           -r src/
           -f sarif
@@ -85,17 +86,12 @@ jobs:
       - name: Sync dependencies
         run: uv sync --extra security
 
-      - name: Install accepted-risk suppressions
-        run: |
-          {
-            echo "args<<EOF"
-            grep -vE '^[[:space:]]*(#|$)' .github/security/pip-audit-ignore.txt \
-              | sed 's/^/--ignore-vuln /'
-            echo "EOF"
-          } >> "$GITHUB_ENV"
-
       - name: Run pip-audit
-        run: uv run pip-audit ${{ env.args }}
+        run: |
+          ARGS=$(grep -vE '^[[:space:]]*(#|$)' .github/security/pip-audit-ignore.txt \
+            | sed 's/^/--ignore-vuln /' | tr '\n' ' ')
+          # shellcheck disable=SC2086
+          uv run pip-audit $ARGS
 
   secrets:
     name: Secret scan (gitleaks)
