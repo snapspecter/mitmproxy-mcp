@@ -133,7 +133,11 @@ jobs:
         run: |
           # Catches a file that is lock-consistent by hash but unsatisfiable as
           # a set (e.g. a transitive pin conflicting with a direct requirement).
-          uv pip install --dry-run --no-cache -r requirements.txt
+          # An isolated venv is required: uv pip install refuses to run without
+          # one, and the project venv must not be touched.
+          uv venv /tmp/resolve-check --python 3.12
+          VIRTUAL_ENV=/tmp/resolve-check uv pip install --dry-run --no-cache \
+            -r requirements.txt
 
   build:
     name: Build (sdist + wheel)
