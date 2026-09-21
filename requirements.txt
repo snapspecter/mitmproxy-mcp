@@ -828,9 +828,9 @@ pydantic-settings==2.15.0 \
     # via
     #   mcp
     #   mitmproxy-mcp
-pydivert==2.1.0 ; sys_platform == 'win32' \
-    --hash=sha256:382db488e3c37c03ec9ec94e061a0b24334d78dbaeebb7d4e4d32ce4355d9da1 \
-    --hash=sha256:f0e150f4ff591b78e35f514e319561dadff7f24a82186a171dd4d465483de5b4
+pydivert==3.1.3 ; sys_platform == 'win32' \
+    --hash=sha256:74ae83a5d1b4a31db8f84a55c1cf875eb4e7a0d2bc2e4730ef171819bc5e9008 \
+    --hash=sha256:e5cba087f3f17eb66cf50965cf9670c55691c580f81dcad20549a0ef49af8e06
     # via mitmproxy
 pyee==13.0.1 \
     --hash=sha256:0b931f7c14535667ed4c7e0d531716368715e860b988770fc7eb8578d1f67fc8 \
