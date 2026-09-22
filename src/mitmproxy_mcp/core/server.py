@@ -144,6 +144,10 @@ class MitmController:
     def _proxy_task_done(self, task: asyncio.Task) -> None:
         """Observe unexpected proxy task failures and clear stale state."""
         if self._stopping:
+            try:
+                task.exception()
+            except asyncio.CancelledError:
+                pass
             return
         try:
             error = task.exception()
@@ -160,37 +164,46 @@ class MitmController:
     async def stop(self):
         if not self.running or not self.master:
             return "The proxy isn't running right now."
-        # Explicitly stop all server instances to release the listening port
-        # and close all active connections (keepalive connections otherwise persist)
-        ps_addon = self.master.addons.get("proxyserver")
-        if ps_addon:
-            for handler in list(ps_addon.connections.values()):
-                try:
-                    for transport_io in list(handler.transports.values()):
-                        if transport_io.writer and not transport_io.writer.is_closing():
-                            transport_io.writer.close()
-                except Exception:
-                    pass
-            for instance in list(ps_addon.servers._instances.values()):
-                try:
-                    await instance.stop()
-                except Exception:
-                    pass
-            ps_addon.servers._instances.clear()
         self._stopping = True
-        self.master.shutdown()
-        if self.proxy_task:
-            done, _ = await asyncio.wait({self.proxy_task}, timeout=5.0)
-            if not done:
-                self.proxy_task.cancel()
-                try:
-                    await self.proxy_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+        master = self.master
+        proxy_task = self.proxy_task
+        try:
+            # Explicitly stop all server instances to release the listening port
+            # and close all active connections (keepalive connections otherwise persist)
+            ps_addon = master.addons.get("proxyserver")
+            if ps_addon:
+                for handler in list(ps_addon.connections.values()):
+                    try:
+                        for transport_io in list(handler.transports.values()):
+                            if transport_io.writer and not transport_io.writer.is_closing():
+                                transport_io.writer.close()
+                    except Exception:
+                        pass
+                for instance in list(ps_addon.servers._instances.values()):
+                    try:
+                        await instance.stop()
+                    except Exception:
+                        pass
+                ps_addon.servers._instances.clear()
+            master.shutdown()
+            if proxy_task:
+                done, _ = await asyncio.wait({proxy_task}, timeout=5.0)
+                if not done:
+                    proxy_task.cancel()
+                    try:
+                        await proxy_task
+                    except asyncio.CancelledError:
+                        pass
+                else:
+                    try:
+                        proxy_task.exception()
+                    except asyncio.CancelledError:
+                        pass
+        finally:
             self.proxy_task = None
-        self.running = False
-        self.master = None
-        self._stopping = False
+            self.running = False
+            self.master = None
+            self._stopping = False
         logger.info("proxy_stopped")
         return "Stopped the proxy."
 
