@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import os
 import sys
@@ -63,6 +64,8 @@ class MitmController:
         self.default_port = 8080
         self.default_host = "127.0.0.1"
         self.auto_start = False
+        self.allow_remote_bind = False
+        self._stopping = False
 
     def _get_verify_param(self, verify_override: Optional[bool] = None) -> Any:
         if verify_override is not None:
@@ -83,6 +86,13 @@ class MitmController:
     ):
         if self.running:
             return "MITM is already running."
+
+        _validate_listen_port(port)
+        if not self.allow_remote_bind and not _is_loopback_host(host):
+            return (
+                "Refusing to bind the proxy to a non-loopback host without "
+                "explicit remote-bind authorization."
+            )
 
         self.port = port
         opts = options.Options(listen_host=host, listen_port=port)
@@ -105,13 +115,31 @@ class MitmController:
             opts.update(save_stream_file=save_path)
             logger.info("flow_dump_enabled", path=save_path)
 
+        self._stopping = False
         self.proxy_task = asyncio.create_task(self.master.run())
+        self.proxy_task.add_done_callback(self._proxy_task_done)
         self.running = True
         logger.info("proxy_started", host=host, port=port)
         msg = f"Started proxy on port {port}"
         if save_path:
             msg += f", dumping flows to {save_path}"
         return msg
+
+    def _proxy_task_done(self, task: asyncio.Task) -> None:
+        """Clear state when the proxy exits unexpectedly."""
+        if self._stopping:
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            error = None
+        self.running = False
+        self.master = None
+        self.proxy_task = None
+        if error is not None:
+            logger.error("proxy_task_failed", error=str(error))
+        else:
+            logger.warning("proxy_stopped_unexpectedly")
 
     async def stop(self):
         if not self.running or not self.master:
@@ -133,6 +161,7 @@ class MitmController:
                 except Exception:
                     pass
             ps_addon.servers._instances.clear()
+        self._stopping = True
         self.master.shutdown()
         if self.proxy_task:
             done, _ = await asyncio.wait({self.proxy_task}, timeout=5.0)
@@ -144,6 +173,8 @@ class MitmController:
                     pass
             self.proxy_task = None
         self.running = False
+        self.master = None
+        self._stopping = False
         logger.info("proxy_stopped")
         return "Stopped the proxy."
 
@@ -230,13 +261,32 @@ class MitmController:
 controller = MitmController()
 
 
+def _validate_listen_port(port: int) -> None:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("listen port must be an integer between 1 and 65535")
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(_server: FastMCP):
     """Auto-start the proxy on boot when --auto-start / MITMPROXY_AUTO_START is set."""
-    if getattr(controller, "auto_start", False) and not controller.running:
-        result = await controller.start(port=controller.default_port, host=controller.default_host)
-        logger.info("auto_start", result=result)
     try:
+        if getattr(controller, "auto_start", False) and not controller.running:
+            result = await controller.start(
+                port=controller.default_port,
+                host=controller.default_host,
+            )
+            if not controller.running:
+                raise RuntimeError(f"Proxy auto-start failed: {result}")
+            logger.info("auto_start", result=result)
         yield
     finally:
         if controller.running:
@@ -1278,6 +1328,15 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _parse_port(value: str) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("listen port must be an integer between 1 and 65535") from exc
+    _validate_listen_port(port)
+    return port
+
+
 def start():
     """Entry point for running the server directly."""
     import argparse
@@ -1297,8 +1356,8 @@ def start():
     )
     parser.add_argument(
         "--port",
-        type=int,
-        default=int(os.environ.get("MITMPROXY_PORT", "8080")),
+        type=_parse_port,
+        default=_parse_port(os.environ.get("MITMPROXY_PORT", "8080")),
         help="Default proxy listen port used by start_proxy and --auto-start "
         "(default 8080). Can also be set via MITMPROXY_PORT env var.",
     )
@@ -1315,6 +1374,13 @@ def start():
         help="Start the proxy immediately on server startup instead of waiting "
         "for the start_proxy tool. Can also be set via MITMPROXY_AUTO_START env var.",
     )
+    parser.add_argument(
+        "--allow-remote-bind",
+        action="store_true",
+        default=_env_flag("MITMPROXY_ALLOW_REMOTE_BIND"),
+        help="Allow binding the proxy to a non-loopback host. Can also be set via "
+        "MITMPROXY_ALLOW_REMOTE_BIND env var.",
+    )
     args, _ = parser.parse_known_args()
 
     global controller
@@ -1325,6 +1391,7 @@ def start():
     controller.default_port = args.port
     controller.default_host = args.host
     controller.auto_start = args.auto_start
+    controller.allow_remote_bind = args.allow_remote_bind
 
     mcp.run()
 
