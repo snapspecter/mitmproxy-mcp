@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import ipaddress
 import logging
 import os
 import sys
@@ -59,6 +61,11 @@ class MitmController:
         self.session_variables = {}
         self.dump_file = dump_file
         self.cli_upstream_proxy: Optional[str] = None
+        self.default_port = 8080
+        self.default_host = "127.0.0.1"
+        self.auto_start = False
+        self.allow_remote_bind = False
+        self._stopping = False
 
     def _get_verify_param(self, verify_override: Optional[bool] = None) -> Any:
         if verify_override is not None:
@@ -79,6 +86,13 @@ class MitmController:
     ):
         if self.running:
             return "MITM is already running."
+
+        _validate_listen_port(port)
+        if not self.allow_remote_bind and not _is_loopback_host(host):
+            return (
+                "Refusing to bind the proxy to a non-loopback host without "
+                "explicit remote-bind authorization."
+            )
 
         self.port = port
         opts = options.Options(listen_host=host, listen_port=port)
@@ -101,13 +115,31 @@ class MitmController:
             opts.update(save_stream_file=save_path)
             logger.info("flow_dump_enabled", path=save_path)
 
+        self._stopping = False
         self.proxy_task = asyncio.create_task(self.master.run())
+        self.proxy_task.add_done_callback(self._proxy_task_done)
         self.running = True
         logger.info("proxy_started", host=host, port=port)
         msg = f"Started proxy on port {port}"
         if save_path:
             msg += f", dumping flows to {save_path}"
         return msg
+
+    def _proxy_task_done(self, task: asyncio.Task) -> None:
+        """Clear state when the proxy exits unexpectedly."""
+        if self._stopping:
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            error = None
+        self.running = False
+        self.master = None
+        self.proxy_task = None
+        if error is not None:
+            logger.error("proxy_task_failed", error=str(error))
+        else:
+            logger.warning("proxy_stopped_unexpectedly")
 
     async def stop(self):
         if not self.running or not self.master:
@@ -129,6 +161,7 @@ class MitmController:
                 except Exception:
                     pass
             ps_addon.servers._instances.clear()
+        self._stopping = True
         self.master.shutdown()
         if self.proxy_task:
             done, _ = await asyncio.wait({self.proxy_task}, timeout=5.0)
@@ -140,6 +173,8 @@ class MitmController:
                     pass
             self.proxy_task = None
         self.running = False
+        self.master = None
+        self._stopping = False
         logger.info("proxy_stopped")
         return "Stopped the proxy."
 
@@ -225,26 +260,65 @@ class MitmController:
 # Global Controller Instance
 controller = MitmController()
 
-mcp = FastMCP("Mitmproxy Manager")
+
+def _validate_listen_port(port: int) -> None:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("listen port must be an integer between 1 and 65535")
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_server: FastMCP):
+    """Auto-start the proxy on boot when --auto-start / MITMPROXY_AUTO_START is set."""
+    try:
+        if getattr(controller, "auto_start", False) and not controller.running:
+            result = await controller.start(
+                port=controller.default_port,
+                host=controller.default_host,
+            )
+            if not controller.running:
+                raise RuntimeError(f"Proxy auto-start failed: {result}")
+            logger.info("auto_start", result=result)
+        yield
+    finally:
+        if controller.running:
+            await controller.stop()
+
+
+mcp = FastMCP("Mitmproxy Manager", lifespan=_lifespan)
 
 # --- MCP Tools ---
 
 
 @mcp.tool()
 async def start_proxy(
-    port: int = 8080, dump_file: Optional[str] = None, upstream_proxy: Optional[str] = None
+    port: Optional[int] = None,
+    dump_file: Optional[str] = None,
+    upstream_proxy: Optional[str] = None,
 ) -> str:
     """
     Start the mitmproxy instance.
     Args:
-        port: Port to listen on (default 8080)
+        port: Port to listen on. Omit to use the server's configured default
+            (--port / MITMPROXY_PORT, else 8080).
         dump_file: Optional file path to save raw mitmproxy .flow data.
             Prefix with + to append to an existing file.
         upstream_proxy: Optional upstream proxy URL (e.g., 'http://user:pass@proxy:port').
     """
     try:
         return await controller.start(
-            port=port, dump_file=dump_file, upstream_proxy=upstream_proxy
+            port=port if port is not None else controller.default_port,
+            host=controller.default_host,
+            dump_file=dump_file,
+            upstream_proxy=upstream_proxy,
         )
     except Exception as e:
         logger.error("proxy_start_failed", error=str(e))
@@ -344,9 +418,7 @@ async def inspect_flows(
     if columns and "id" not in columns:
         columns.insert(0, "id")
 
-    results = controller.recorder.db.get_by_ids(
-        ids, columns=columns, ordered_headers=True
-    )
+    results = controller.recorder.db.get_by_ids(ids, columns=columns, ordered_headers=True)
 
     if derived_fields:
         for entry in results:
@@ -438,26 +510,28 @@ async def load_traffic_file(
         scope: Comma-separated list of domains to filter by during import.
             Only flows matching these domains are imported.
     """
-    scope_list = (
-        [d.strip() for d in scope.split(",") if d.strip()] if scope else None
-    )
+    scope_list = [d.strip() for d in scope.split(",") if d.strip()] if scope else None
 
     # Security: Prevent path traversal and restrict to working directory
     try:
         requested_path = Path(file_path).resolve()
         base_dir = Path.cwd().resolve()
         if not str(requested_path).startswith(str(base_dir)):
-            return json.dumps({
-                "status": "error",
-                "message": f"Security Error: Access denied to {file_path}. Path must be within the project directory."
-            })
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": f"Security Error: Access denied to {file_path}. Path must be within the project directory.",
+                }
+            )
     except Exception as e:
         return json.dumps({"status": "error", "message": f"Invalid path: {str(e)}"})
 
     try:
         stats = await asyncio.to_thread(
             controller.recorder.db.import_from_file,
-            str(requested_path), append=append, scope=scope_list
+            str(requested_path),
+            append=append,
+            scope=scope_list,
         )
         return json.dumps(
             {
@@ -1246,6 +1320,23 @@ async def generate_scraper_code(flow_ids: str, target_framework: str = "curl_cff
     return render_scraper_code(target_framework, normalized_flows)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var (1/true/yes/on are truthy, case-insensitive)."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_port(value: str) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("listen port must be an integer between 1 and 65535") from exc
+    _validate_listen_port(port)
+    return port
+
+
 def start():
     """Entry point for running the server directly."""
     import argparse
@@ -1263,12 +1354,44 @@ def start():
         help="Upstream proxy URL (e.g., http://user:pass@proxy:port). "
         "Can also be set via MITMPROXY_UPSTREAM_PROXY env var.",
     )
+    parser.add_argument(
+        "--port",
+        type=_parse_port,
+        default=_parse_port(os.environ.get("MITMPROXY_PORT", "8080")),
+        help="Default proxy listen port used by start_proxy and --auto-start "
+        "(default 8080). Can also be set via MITMPROXY_PORT env var.",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("MITMPROXY_HOST", "127.0.0.1"),
+        help="Default proxy listen host (default 127.0.0.1). "
+        "Can also be set via MITMPROXY_HOST env var.",
+    )
+    parser.add_argument(
+        "--auto-start",
+        action="store_true",
+        default=_env_flag("MITMPROXY_AUTO_START"),
+        help="Start the proxy immediately on server startup instead of waiting "
+        "for the start_proxy tool. Can also be set via MITMPROXY_AUTO_START env var.",
+    )
+    parser.add_argument(
+        "--allow-remote-bind",
+        action="store_true",
+        default=_env_flag("MITMPROXY_ALLOW_REMOTE_BIND"),
+        help="Allow binding the proxy to a non-loopback host. Can also be set via "
+        "MITMPROXY_ALLOW_REMOTE_BIND env var.",
+    )
     args, _ = parser.parse_known_args()
 
     global controller
-    # Store CLI upstream proxy if provided
     controller = MitmController(dump_file=args.dump_file)
     controller.cli_upstream_proxy = args.upstream_proxy
+    # start_proxy() and --auto-start fall back to these when no port is passed,
+    # so a wrapper can pin a per-agent port that the browser also targets.
+    controller.default_port = args.port
+    controller.default_host = args.host
+    controller.auto_start = args.auto_start
+    controller.allow_remote_bind = args.allow_remote_bind
 
     mcp.run()
 
