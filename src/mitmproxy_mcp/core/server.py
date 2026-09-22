@@ -115,6 +115,22 @@ class MitmController:
             opts.update(save_stream_file=save_path)
             logger.info("flow_dump_enabled", path=save_path)
 
+        # pre-check: fail fast if the port is taken. mitmproxy's master.run() dies
+        # async with SystemExit on bind failure, which would otherwise leave a false
+        # "Started" + running=True. A synchronous probe bind is deterministic.
+        import socket
+
+        probe = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind((host, port))
+        except OSError as e:
+            probe.close()
+            self.master = None
+            logger.error("proxy_start_failed", host=host, port=port, error=str(e))
+            return f"Couldn't start the proxy on {host}:{port}: {e}"
+        finally:
+            probe.close()
+
         self._stopping = False
         self.proxy_task = asyncio.create_task(self.master.run())
         self.proxy_task.add_done_callback(self._proxy_task_done)
@@ -126,7 +142,7 @@ class MitmController:
         return msg
 
     def _proxy_task_done(self, task: asyncio.Task) -> None:
-        """Clear state when the proxy exits unexpectedly."""
+        """Observe unexpected proxy task failures and clear stale state."""
         if self._stopping:
             return
         try:
