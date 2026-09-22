@@ -59,6 +59,7 @@ class MitmController:
         self.session_variables = {}
         self.dump_file = dump_file
         self.cli_upstream_proxy: Optional[str] = None
+        self._stopping = False
 
     def _get_verify_param(self, verify_override: Optional[bool] = None) -> Any:
         if verify_override is not None:
@@ -105,7 +106,8 @@ class MitmController:
         # async with SystemExit on bind failure, which would otherwise leave a false
         # "Started" + running=True. A synchronous probe bind is deterministic.
         import socket
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        probe = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
         try:
             probe.bind((host, port))
         except OSError as e:
@@ -113,15 +115,34 @@ class MitmController:
             self.master = None
             logger.error("proxy_start_failed", host=host, port=port, error=str(e))
             return f"Couldn't start the proxy on {host}:{port}: {e}"
-        probe.close()
+        finally:
+            probe.close()
 
+        self._stopping = False
         self.proxy_task = asyncio.create_task(self.master.run())
+        self.proxy_task.add_done_callback(self._proxy_task_done)
         self.running = True
         logger.info("proxy_started", host=host, port=port)
         msg = f"Started proxy on port {port}"
         if save_path:
             msg += f", dumping flows to {save_path}"
         return msg
+
+    def _proxy_task_done(self, task: asyncio.Task) -> None:
+        """Observe unexpected proxy task failures and clear stale state."""
+        if self._stopping:
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            error = None
+        self.running = False
+        self.master = None
+        self.proxy_task = None
+        if error is not None:
+            logger.error("proxy_task_failed", error=str(error))
+        else:
+            logger.warning("proxy_stopped_unexpectedly")
 
     async def stop(self):
         if not self.running or not self.master:
@@ -143,6 +164,7 @@ class MitmController:
                 except Exception:
                     pass
             ps_addon.servers._instances.clear()
+        self._stopping = True
         self.master.shutdown()
         if self.proxy_task:
             done, _ = await asyncio.wait({self.proxy_task}, timeout=5.0)
@@ -154,6 +176,8 @@ class MitmController:
                     pass
             self.proxy_task = None
         self.running = False
+        self.master = None
+        self._stopping = False
         logger.info("proxy_stopped")
         return "Stopped the proxy."
 
