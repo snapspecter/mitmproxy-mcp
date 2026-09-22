@@ -696,7 +696,7 @@ wheels = [
 
 [[package]]
 name = "mitmproxy-mcp"
-version = "0.5.1"
+version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -729,7 +729,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "httpx-sse", specifier = ">=0.4.0" },
     { name = "jsonpath-ng", specifier = ">=1.8.0" },
-    { name = "mcp", specifier = ">=1.25.0" },
+    { name = "mcp", specifier = ">=1.25.0,<2.0.0" },
     { name = "mitmproxy", specifier = ">=12.0.0" },
     { name = "playwright", specifier = ">=1.58.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
