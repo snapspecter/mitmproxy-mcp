@@ -11,8 +11,11 @@ class ScopeManager:
 
     def is_allowed(self, flow: http.HTTPFlow) -> bool:
         if self.config.allowed_domains:
-            host = flow.request.host
-            if not any(d in host for d in self.config.allowed_domains):
+            host = flow.request.host.lower()
+            if not any(
+                host == d.lower() or host.endswith("." + d.lower())
+                for d in self.config.allowed_domains
+            ):
                 return False
 
         path = flow.request.path.lower().split("?")[0]
