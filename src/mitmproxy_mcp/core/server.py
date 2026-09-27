@@ -112,8 +112,23 @@ class MitmController:
 
         save_path = dump_file or self.dump_file
         if save_path:
-            opts.update(save_stream_file=save_path)
-            logger.info("flow_dump_enabled", path=save_path)
+            try:
+                resolved_target = _validate_contained_path(save_path, allow_append_prefix=True)
+                save_path_opts = f"+{resolved_target}" if save_path.startswith("+") else str(resolved_target)
+            except PermissionError as e:
+                logger.error("proxy_start_path_denied", path=save_path, error=str(e))
+                return json.dumps({
+                    "status": "error",
+                    "message": str(e),
+                })
+            except Exception as e:
+                logger.error("proxy_start_path_invalid", path=save_path, error=str(e))
+                return json.dumps({
+                    "status": "error",
+                    "message": f"Invalid path: {str(e)}",
+                })
+            opts.update(save_stream_file=save_path_opts)
+            logger.info("flow_dump_enabled", path=save_path_opts)
 
         # pre-check: fail fast if the port is taken. mitmproxy's master.run() dies
         # async with SystemExit on bind failure, which would otherwise leave a false
@@ -288,6 +303,31 @@ class MitmController:
 
 # Global Controller Instance
 controller = MitmController()
+
+
+def _validate_contained_path(
+    path_str: str,
+    base_dir: Optional[Path] = None,
+    allow_append_prefix: bool = False,
+) -> Path:
+    if not path_str or not isinstance(path_str, str):
+        raise ValueError("path cannot be empty")
+
+    raw = path_str
+    if allow_append_prefix and raw.startswith("+"):
+        raw = raw[1:]
+
+    if not raw:
+        raise ValueError("path cannot be empty")
+
+    base = (base_dir or Path.cwd()).resolve()
+    target = Path(raw).resolve()
+
+    if not target.is_relative_to(base):
+        raise PermissionError(
+            f"Security Error: Access denied to {path_str}. Path must be within the project directory."
+        )
+    return target
 
 
 def _validate_listen_port(port: int) -> None:
@@ -543,13 +583,12 @@ async def load_traffic_file(
 
     # Security: Prevent path traversal and restrict to working directory
     try:
-        requested_path = Path(file_path).resolve()
-        base_dir = Path.cwd().resolve()
-        if not requested_path.is_relative_to(base_dir):
-            return json.dumps({
-                "status": "error",
-                "message": f"Security Error: Access denied to {file_path}. Path must be within the project directory."
-            })
+        requested_path = _validate_contained_path(file_path, allow_append_prefix=False)
+    except PermissionError as e:
+        return json.dumps({
+            "status": "error",
+            "message": str(e),
+        })
     except Exception as e:
         return json.dumps({"status": "error", "message": f"Invalid path: {str(e)}"})
 
