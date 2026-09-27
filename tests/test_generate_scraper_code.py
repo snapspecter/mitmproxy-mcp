@@ -312,3 +312,21 @@ async def test_generate_scraper_code_prevents_fstring_code_execution(monkeypatch
         compile(code, "<generated>", "exec")
         # Ensure that no f-string evaluation takes place
         assert not sentinel_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_generate_scraper_code_rejects_unsupported_framework(monkeypatch):
+    flow_id = "flow-test"
+
+    def fake_get_flow_detail(fid):
+        return {
+            "id": flow_id,
+            "request": {"method": "GET", "url": "https://example.com", "headers": {}},
+        }
+
+    monkeypatch.setattr(server.controller.recorder, "get_flow_detail", fake_get_flow_detail)
+    monkeypatch.setattr(server.controller.recorder, "get_live_flow", lambda fid: None)
+
+    result = await server.generate_scraper_code(flow_id, target_framework="../traversal")
+    assert "not supported yet" in result
+
