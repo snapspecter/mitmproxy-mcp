@@ -749,14 +749,14 @@ async def fuzz_endpoint(
 
     # Get baseline response for anomaly detection
     try:
-        baseline_flow = controller.recorder.db.get_flow_object(flow_id)
-        if baseline_flow and baseline_flow.response:
-            baseline_status = baseline_flow.response.status_code
+        baseline_resp = flow_data.get("response") if flow_data else None
+        if baseline_resp and baseline_resp.get("status_code") is not None:
+            baseline_status = baseline_resp["status_code"]
         else:
             baseline_status = 200
 
-        if baseline_flow and baseline_flow.response and baseline_flow.response.content:
-            baseline_len = len(baseline_flow.response.content)
+        if baseline_resp and baseline_resp.get("body_preview"):
+            baseline_len = len(baseline_resp["body_preview"])
         else:
             baseline_len = 0
     except Exception:

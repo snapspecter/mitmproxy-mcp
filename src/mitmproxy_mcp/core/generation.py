@@ -89,7 +89,13 @@ def normalize_scraper_flows(flows: List[Dict[str, Any]], recorder: Any) -> List[
     return normalized_flows
 
 
+SUPPORTED_FRAMEWORKS = {"curl_cffi", "requests", "aiohttp", "playwright"}
+
+
 def render_scraper_code(target_framework: str, flows: List[Dict[str, Any]]) -> str:
+    if target_framework not in SUPPORTED_FRAMEWORKS:
+        return f"Framework '{target_framework}' is not supported yet."
+
     env = _try_load_template_environment()
     try:
         template = env.get_template(f"{target_framework}.jinja2")

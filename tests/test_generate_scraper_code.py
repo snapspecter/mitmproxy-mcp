@@ -282,3 +282,51 @@ async def test_generate_scraper_code_escapes_malicious_url(monkeypatch):
         assert not stripped.startswith("os.system"), (
             f"Injection succeeded — bare 'os.system' found: {line}"
         )
+
+
+@pytest.mark.asyncio
+async def test_generate_scraper_code_prevents_fstring_code_execution(monkeypatch, tmp_path):
+    sentinel_file = tmp_path / "sentinel.txt"
+    flow_id = "flow-fstring-inject"
+    malicious_url = f"https://x.com/{{open('{sentinel_file}', 'w').write('pwned')}}"
+
+    def fake_get_flow_detail(fid):
+        if fid != flow_id:
+            return None
+        return {
+            "id": flow_id,
+            "request": {
+                "method": "GET",
+                "url": malicious_url,
+                "headers": {},
+                "body_preview": None,
+            },
+        }
+
+    monkeypatch.setattr(server.controller.recorder, "get_flow_detail", fake_get_flow_detail)
+    monkeypatch.setattr(server.controller.recorder, "get_live_flow", lambda fid: None)
+    monkeypatch.setattr(server.controller.recorder.db, "get_flow_object", lambda fid: None)
+
+    for framework in ("curl_cffi", "requests", "aiohttp", "playwright"):
+        code = await server.generate_scraper_code(flow_id, target_framework=framework)
+        compile(code, "<generated>", "exec")
+        # Ensure that no f-string evaluation takes place
+        assert not sentinel_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_generate_scraper_code_rejects_unsupported_framework(monkeypatch):
+    flow_id = "flow-test"
+
+    def fake_get_flow_detail(fid):
+        return {
+            "id": flow_id,
+            "request": {"method": "GET", "url": "https://example.com", "headers": {}},
+        }
+
+    monkeypatch.setattr(server.controller.recorder, "get_flow_detail", fake_get_flow_detail)
+    monkeypatch.setattr(server.controller.recorder, "get_live_flow", lambda fid: None)
+
+    result = await server.generate_scraper_code(flow_id, target_framework="../traversal")
+    assert "not supported yet" in result
+

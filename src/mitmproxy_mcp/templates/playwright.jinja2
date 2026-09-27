@@ -11,7 +11,7 @@ async def run_scraper():
         page = await context.new_page()
         page.set_default_timeout(30000)
 {% for flow in flows %}
-        print(f"\n[Step {{ loop.index }}] Executing {{ flow.method }} {{ flow.url_preview }}...")
+        print("\n[Step {{ loop.index }}] Executing " + {{ to_json(flow.method) }} + " " + {{ to_json(flow.url_preview) }} + "...")
         headers_{{ loop.index0 }} = {{ to_json(flow.headers, indent=4) | replace('\n', '\n        ') }}
 {% if flow.is_navigation %}
         try:

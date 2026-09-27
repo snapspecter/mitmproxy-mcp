@@ -447,7 +447,7 @@ class TrafficDB:
 
     def _generate_curl(self, request: SimpleRequest) -> str:
         try:
-            cmd = ["curl", "-X", request.method]
+            cmd = ["curl", "-X", shlex.quote(request.method)]
             cmd.append(shlex.quote(request.url))
 
             for key, value in request.headers.items():
