@@ -15,11 +15,13 @@ import re2
 import structlog
 
 from mcp.server.fastmcp import FastMCP
+from mitmproxy import exceptions
 from mitmproxy import master as mitm_master
 from mitmproxy import options
 from mitmproxy.tools.dump import DumpMaster
 from mitmproxy.tools.web.master import WebMaster
 import tornado.httpserver
+from tornado.log import access_log as tornado_access_log
 from curl_cffi.requests import AsyncSession
 from jsonpath_ng import parse as parse_jsonpath
 from bs4 import BeautifulSoup
@@ -51,10 +53,28 @@ logging.basicConfig(
 logger = structlog.get_logger()
 
 
+def _log_web_request(handler) -> None:
+    """Tornado's access log minus the query string, which carries the UI token."""
+    status = handler.get_status()
+    if status < 400:
+        log = tornado_access_log.info
+    elif status < 500:
+        log = tornado_access_log.warning
+    else:
+        log = tornado_access_log.error
+    req = handler.request
+    log("%d %s %s (%s) %.2fms", status, req.method, req.path, req.remote_ip,
+        1000.0 * req.request_time())
+
+
 class McpWebMaster(WebMaster):
     """WebMaster that keeps its HTTP server, so stop() can free web_port."""
 
     http_server: Optional[tornado.httpserver.HTTPServer] = None
+
+    def __init__(self, opts: options.Options, with_termlog: bool = True):
+        super().__init__(opts, with_termlog=with_termlog)
+        self.app.settings["log_function"] = _log_web_request
 
     async def running(self):
         # Mirrors WebMaster.running(), which drops the server on the floor.
@@ -82,6 +102,7 @@ class MitmController:
         self.default_web = False
         self.default_web_port = 8081
         self.default_web_host = "127.0.0.1"
+        self.web_password: Optional[str] = None
         self.web_url: Optional[str] = None
         self.auto_start = False
         self.allow_remote_bind = False
@@ -138,6 +159,13 @@ class MitmController:
             self.master = McpWebMaster(opts, with_termlog=False)
             # These options only exist once WebMaster has loaded its addons.
             opts.update(web_port=web_port, web_host=web_host, web_open_browser=False)
+            if self.web_password:
+                try:
+                    opts.update(web_password=self.web_password)
+                except exceptions.OptionsError as e:
+                    self.master = None
+                    logger.error("web_password_invalid", error=str(e))
+                    return f"Couldn't start the web UI: {e}"
         else:
             self.master = DumpMaster(
                 opts,
@@ -202,6 +230,8 @@ class MitmController:
             msg += f", dumping flows to {save_path}"
         if self.web_url:
             msg += f". Web UI: {self.web_url}"
+            if self.web_password:
+                msg += " (protected by the configured web password)"
         return msg
 
     def _proxy_task_done(self, task: asyncio.Task) -> None:
@@ -453,7 +483,8 @@ async def start_proxy(
         upstream_proxy: Optional upstream proxy URL (e.g., 'http://user:pass@proxy:port').
         web: Also serve the mitmweb UI. Omit to use the server's default
             (--web / MITMPROXY_WEB, else off). Passing web_port or web_host
-            turns it on. The result carries the UI URL with its access token.
+            turns it on. The result carries the UI URL with its access token,
+            or without one when --web-password / MITMPROXY_WEB_PASSWORD is set.
         web_port: Web UI port. Omit for --web-port / MITMPROXY_WEB_PORT, else 8081.
         web_host: Web UI host. Omit for --web-host / MITMPROXY_WEB_HOST, else
             127.0.0.1. A non-loopback host needs --allow-remote-bind.
@@ -1548,6 +1579,13 @@ def start():
         help="Default web UI host (default 127.0.0.1). Can also be set via "
         "MITMPROXY_WEB_HOST env var.",
     )
+    parser.add_argument(
+        "--web-password",
+        default=os.environ.get("MITMPROXY_WEB_PASSWORD") or None,
+        help="Static web UI password instead of a random per-start token. A value "
+        "starting with $ is read as an argon2 hash. Prefer the "
+        "MITMPROXY_WEB_PASSWORD env var: a flag is visible in the process list.",
+    )
     args, _ = parser.parse_known_args()
 
     global controller
@@ -1560,6 +1598,7 @@ def start():
     controller.default_web = args.web
     controller.default_web_port = args.web_port
     controller.default_web_host = args.web_host
+    controller.web_password = args.web_password
     controller.auto_start = args.auto_start
     controller.allow_remote_bind = args.allow_remote_bind
 

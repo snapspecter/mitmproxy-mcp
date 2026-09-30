@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import socket
 import urllib.error
 import urllib.request
@@ -118,6 +119,64 @@ async def test_web_port_clash_with_proxy_refused(controller):
     result = await server.start_proxy(port=port, web_port=port)
     assert "can't share" in result
     assert not controller.running
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hashed", [False, True])
+async def test_static_web_password(controller, hashed):
+    import argon2
+
+    secret = "test-web-password"
+    controller.web_password = argon2.PasswordHasher().hash(secret) if hashed else secret
+    web_port = _free_port()
+    result = await server.start_proxy(port=_free_port(), web_port=web_port)
+    try:
+        assert controller.running, result
+        assert "token=" not in result
+        assert secret not in result
+        assert "protected by the configured web password" in result
+        await asyncio.sleep(0.5)
+        base = f"http://127.0.0.1:{web_port}/"
+        assert await asyncio.to_thread(_http_status, f"{base}?token={secret}") == 200
+        assert await asyncio.to_thread(_http_status, f"{base}?token=wrong") == 403
+    finally:
+        await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_access_log_drops_the_token(controller, caplog):
+    web_port = _free_port()
+    await server.start_proxy(port=_free_port(), web_port=web_port)
+    try:
+        token = controller.web_url.split("token=")[1]
+        await asyncio.sleep(0.5)
+        with caplog.at_level(logging.INFO, logger="tornado.access"):
+            assert await asyncio.to_thread(_http_status, controller.web_url) == 200
+    finally:
+        await controller.stop()
+    access = [r.getMessage() for r in caplog.records if r.name == "tornado.access"]
+    assert any(line.startswith("200 GET / ") for line in access), access
+    assert not any(token in line for line in access)
+
+
+@pytest.mark.asyncio
+async def test_invalid_web_password_hash_refused(controller):
+    controller.web_password = "$not-an-argon2-hash"
+    result = await server.start_proxy(port=_free_port(), web=True, web_port=_free_port())
+    assert "Couldn't start the web UI" in result
+    assert "argon2" in result
+    assert not controller.running
+
+
+@pytest.mark.asyncio
+async def test_web_password_ignored_without_web(controller):
+    controller.web_password = "test-web-password"
+    result = await server.start_proxy(port=_free_port())
+    try:
+        assert controller.running
+        assert "Web UI" not in result
+    finally:
+        await controller.stop()
 
 
 @pytest.mark.asyncio
