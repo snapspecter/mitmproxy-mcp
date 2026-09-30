@@ -15,8 +15,11 @@ import re2
 import structlog
 
 from mcp.server.fastmcp import FastMCP
+from mitmproxy import master as mitm_master
 from mitmproxy import options
 from mitmproxy.tools.dump import DumpMaster
+from mitmproxy.tools.web.master import WebMaster
+import tornado.httpserver
 from curl_cffi.requests import AsyncSession
 from jsonpath_ng import parse as parse_jsonpath
 from bs4 import BeautifulSoup
@@ -48,9 +51,22 @@ logging.basicConfig(
 logger = structlog.get_logger()
 
 
+class McpWebMaster(WebMaster):
+    """WebMaster that keeps its HTTP server, so stop() can free web_port."""
+
+    http_server: Optional[tornado.httpserver.HTTPServer] = None
+
+    async def running(self):
+        # Mirrors WebMaster.running(), which drops the server on the floor.
+        self.http_server = tornado.httpserver.HTTPServer(self.app, max_buffer_size=2**32)
+        self.http_server.listen(self.options.web_port, self.options.web_host)
+        logger.info("web_ui_listening", host=self.options.web_host, port=self.options.web_port)
+        return await mitm_master.Master.running(self)
+
+
 class MitmController:
     def __init__(self, dump_file: Optional[str] = None):
-        self.master: Optional[DumpMaster] = None
+        self.master: Optional[DumpMaster | McpWebMaster] = None
         self.proxy_task: Optional[asyncio.Task] = None
         self.scope_config = ScopeConfig()
         self.scope_manager = ScopeManager(self.scope_config)
@@ -63,6 +79,10 @@ class MitmController:
         self.cli_upstream_proxy: Optional[str] = None
         self.default_port = 8080
         self.default_host = "127.0.0.1"
+        self.default_web = False
+        self.default_web_port = 8081
+        self.default_web_host = "127.0.0.1"
+        self.web_url: Optional[str] = None
         self.auto_start = False
         self.allow_remote_bind = False
         self._stopping = False
@@ -83,16 +103,28 @@ class MitmController:
         host: str = "127.0.0.1",
         dump_file: Optional[str] = None,
         upstream_proxy: Optional[str] = None,
+        web: bool = False,
+        web_port: int = 8081,
+        web_host: str = "127.0.0.1",
     ):
         if self.running:
             return "MITM is already running."
 
         _validate_listen_port(port)
+        if web:
+            _validate_listen_port(web_port)
         if not self.allow_remote_bind and not _is_loopback_host(host):
             return (
                 "Refusing to bind the proxy to a non-loopback host without "
                 "explicit remote-bind authorization."
             )
+        if web and not self.allow_remote_bind and not _is_loopback_host(web_host):
+            return (
+                "Refusing to bind the web UI to a non-loopback host without "
+                "explicit remote-bind authorization."
+            )
+        if web and (host, port) == (web_host, web_port):
+            return f"The proxy and the web UI can't share {host}:{port}."
 
         self.port = port
         opts = options.Options(listen_host=host, listen_port=port)
@@ -102,11 +134,16 @@ class MitmController:
             opts.update(mode=f"upstream:{up_proxy}")
             logger.info("upstream_proxy_configured", url=up_proxy)
 
-        self.master = DumpMaster(
-            opts,
-            with_termlog=False,
-            with_dumper=False,
-        )
+        if web:
+            self.master = McpWebMaster(opts, with_termlog=False)
+            # These options only exist once WebMaster has loaded its addons.
+            opts.update(web_port=web_port, web_host=web_host, web_open_browser=False)
+        else:
+            self.master = DumpMaster(
+                opts,
+                with_termlog=False,
+                with_dumper=False,
+            )
         self.master.addons.add(self.recorder)
         self.master.addons.add(self.interceptor)
 
@@ -135,25 +172,36 @@ class MitmController:
         # "Started" + running=True. A synchronous probe bind is deterministic.
         import socket
 
-        probe = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            probe.bind((host, port))
-        except OSError as e:
-            probe.close()
-            self.master = None
-            logger.error("proxy_start_failed", host=host, port=port, error=str(e))
-            return f"Couldn't start the proxy on {host}:{port}: {e}"
-        finally:
-            probe.close()
+        binds = [("proxy", host, port)]
+        if web:
+            binds.append(("web UI", web_host, web_port))
+        for label, bind_host, bind_port in binds:
+            family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+            probe = socket.socket(family, socket.SOCK_STREAM)
+            if os.name != "nt":
+                # As the real listeners do: TIME_WAIT from a stopped run
+                # passes, a live listener still fails the bind.
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind((bind_host, bind_port))
+            except OSError as e:
+                self.master = None
+                logger.error("proxy_start_failed", host=bind_host, port=bind_port, error=str(e))
+                return f"Couldn't start the {label} on {bind_host}:{bind_port}: {e}"
+            finally:
+                probe.close()
 
         self._stopping = False
         self.proxy_task = asyncio.create_task(self.master.run())
         self.proxy_task.add_done_callback(self._proxy_task_done)
         self.running = True
-        logger.info("proxy_started", host=host, port=port)
+        self.web_url = self.master.web_url if web else None
+        logger.info("proxy_started", host=host, port=port, web=web)
         msg = f"Started proxy on port {port}"
         if save_path:
             msg += f", dumping flows to {save_path}"
+        if self.web_url:
+            msg += f". Web UI: {self.web_url}"
         return msg
 
     def _proxy_task_done(self, task: asyncio.Task) -> None:
@@ -168,9 +216,13 @@ class MitmController:
             error = task.exception()
         except asyncio.CancelledError:
             error = None
+        http_server = getattr(self.master, "http_server", None)
+        if http_server:
+            http_server.stop()
         self.running = False
         self.master = None
         self.proxy_task = None
+        self.web_url = None
         if error is not None:
             logger.error("proxy_task_failed", error=str(error))
         else:
@@ -200,6 +252,13 @@ class MitmController:
                     except Exception:
                         pass
                 ps_addon.servers._instances.clear()
+            http_server = getattr(master, "http_server", None)
+            if http_server:
+                http_server.stop()
+                try:
+                    await asyncio.wait_for(http_server.close_all_connections(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning("web_ui_connections_not_closed")
             master.shutdown()
             if proxy_task:
                 done, _ = await asyncio.wait({proxy_task}, timeout=5.0)
@@ -218,6 +277,7 @@ class MitmController:
             self.proxy_task = None
             self.running = False
             self.master = None
+            self.web_url = None
             self._stopping = False
         logger.info("proxy_stopped")
         return "Stopped the proxy."
@@ -352,6 +412,9 @@ async def _lifespan(_server: FastMCP):
             result = await controller.start(
                 port=controller.default_port,
                 host=controller.default_host,
+                web=controller.default_web,
+                web_port=controller.default_web_port,
+                web_host=controller.default_web_host,
             )
             if not controller.running:
                 raise RuntimeError(f"Proxy auto-start failed: {result}")
@@ -370,24 +433,42 @@ mcp = FastMCP("Mitmproxy Manager", lifespan=_lifespan)
 @mcp.tool()
 async def start_proxy(
     port: Optional[int] = None,
+    host: Optional[str] = None,
     dump_file: Optional[str] = None,
     upstream_proxy: Optional[str] = None,
+    web: Optional[bool] = None,
+    web_port: Optional[int] = None,
+    web_host: Optional[str] = None,
 ) -> str:
     """
     Start the mitmproxy instance.
     Args:
         port: Port to listen on. Omit to use the server's configured default
             (--port / MITMPROXY_PORT, else 8080).
+        host: Host to listen on. Omit to use the server's configured default
+            (--host / MITMPROXY_HOST, else 127.0.0.1). A non-loopback host needs
+            --allow-remote-bind.
         dump_file: Optional file path to save raw mitmproxy .flow data.
             Prefix with + to append to an existing file.
         upstream_proxy: Optional upstream proxy URL (e.g., 'http://user:pass@proxy:port').
+        web: Also serve the mitmweb UI. Omit to use the server's default
+            (--web / MITMPROXY_WEB, else off). Passing web_port or web_host
+            turns it on. The result carries the UI URL with its access token.
+        web_port: Web UI port. Omit for --web-port / MITMPROXY_WEB_PORT, else 8081.
+        web_host: Web UI host. Omit for --web-host / MITMPROXY_WEB_HOST, else
+            127.0.0.1. A non-loopback host needs --allow-remote-bind.
     """
+    if web is None:
+        web = controller.default_web or web_port is not None or web_host is not None
     try:
         return await controller.start(
             port=port if port is not None else controller.default_port,
-            host=controller.default_host,
+            host=host if host is not None else controller.default_host,
             dump_file=dump_file,
             upstream_proxy=upstream_proxy,
+            web=web,
+            web_port=web_port if web_port is not None else controller.default_web_port,
+            web_host=web_host if web_host is not None else controller.default_web_host,
         )
     except Exception as e:
         logger.error("proxy_start_failed", error=str(e))
@@ -1447,6 +1528,26 @@ def start():
         help="Allow binding the proxy to a non-loopback host. Can also be set via "
         "MITMPROXY_ALLOW_REMOTE_BIND env var.",
     )
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        default=_env_flag("MITMPROXY_WEB"),
+        help="Serve the mitmweb UI alongside the proxy by default. Can also be set "
+        "via MITMPROXY_WEB env var.",
+    )
+    parser.add_argument(
+        "--web-port",
+        type=_parse_port,
+        default=_parse_port(os.environ.get("MITMPROXY_WEB_PORT", "8081")),
+        help="Default web UI port (default 8081). Can also be set via "
+        "MITMPROXY_WEB_PORT env var.",
+    )
+    parser.add_argument(
+        "--web-host",
+        default=os.environ.get("MITMPROXY_WEB_HOST", "127.0.0.1"),
+        help="Default web UI host (default 127.0.0.1). Can also be set via "
+        "MITMPROXY_WEB_HOST env var.",
+    )
     args, _ = parser.parse_known_args()
 
     global controller
@@ -1456,6 +1557,9 @@ def start():
     # so a wrapper can pin a per-agent port that the browser also targets.
     controller.default_port = args.port
     controller.default_host = args.host
+    controller.default_web = args.web
+    controller.default_web_port = args.web_port
+    controller.default_web_host = args.web_host
     controller.auto_start = args.auto_start
     controller.allow_remote_bind = args.allow_remote_bind
 

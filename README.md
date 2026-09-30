@@ -104,7 +104,8 @@ pip install mitmproxy-mcp
 
 ### Lifecycle & Configuration
 
-* `start_proxy(port=8080)`: Starts the mitmproxy server.
+* `start_proxy(port=8080, host="127.0.0.1", web=False, web_port=8081, web_host="127.0.0.1")`: Starts the mitmproxy server. With `web=True` (or any `web_port` / `web_host`) it also serves the mitmweb UI, and the result carries the UI URL with its access token. Omitted arguments fall back to the server defaults below.
+* Server defaults, as CLI flags or env vars: `--port` / `MITMPROXY_PORT`, `--host` / `MITMPROXY_HOST`, `--web` / `MITMPROXY_WEB`, `--web-port` / `MITMPROXY_WEB_PORT`, `--web-host` / `MITMPROXY_WEB_HOST`, `--auto-start` / `MITMPROXY_AUTO_START`. A non-loopback `host` or `web_host` needs `--allow-remote-bind` / `MITMPROXY_ALLOW_REMOTE_BIND`.
 * `stop_proxy()`: Shuts down the proxy.
 * `set_scope(allowed_domains)`: Filters recorded traffic (e.g., `["api.github.com", "example.com"]`).
 * `list_tools()`: Returns all exposed MCP tools and input schemas.
