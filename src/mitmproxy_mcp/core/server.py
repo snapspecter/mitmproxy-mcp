@@ -460,7 +460,7 @@ async def inspect_flow(flow_id: str, full_body: bool = False) -> str:
 @mcp.tool()
 async def inspect_flows(
     flow_ids: str,
-    fields: str = None,
+    fields: Optional[str] = None,
     full_body: bool = False,
 ) -> str:
     """
@@ -567,7 +567,7 @@ async def get_flow_schema(flow_id: str) -> str:
 async def load_traffic_file(
     file_path: str,
     append: bool = False,
-    scope: str = None,
+    scope: Optional[str] = None,
 ) -> str:
     """
     Import flows from a HAR or mitmproxy flow file into the traffic database.
@@ -612,7 +612,11 @@ async def load_traffic_file(
 
 
 @mcp.tool()
-async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: str = None) -> str:
+async def extract_from_flow(
+    flow_id: str,
+    json_path: Optional[str] = None,
+    css_selector: Optional[str] = None,
+) -> str:
     """
     Extract specific data from a flow's response body using JSONPath or CSS
     selectors.
@@ -661,9 +665,9 @@ async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: s
 
 @mcp.tool()
 async def search_traffic(
-    query: str = None,
-    domain: str = None,
-    method: str = None,
+    query: Optional[str] = None,
+    domain: Optional[str] = None,
+    method: Optional[str] = None,
     limit: int = 50,
 ) -> str:
     """
@@ -924,9 +928,9 @@ async def fuzz_endpoint(
 @mcp.tool()
 async def replay_flow(
     flow_id: str,
-    method: str = None,
-    headers_json: str = None,
-    body: str = None,
+    method: Optional[str] = None,
+    headers_json: Optional[str] = None,
+    body: Optional[str] = None,
     timeout: float = 30.0,
 ) -> str:
     """
@@ -971,10 +975,10 @@ async def add_interception_rule(
     rule_id: str,
     action_type: str,
     url_pattern: str = ".*",
-    method: str = None,
-    key: str = None,
-    value: str = None,
-    search_pattern: str = None,
+    method: Optional[str] = None,
+    key: Optional[str] = None,
+    value: Optional[str] = None,
+    search_pattern: Optional[str] = None,
     phase: str = "request",
 ) -> str:
     if phase not in ["request", "response"]:
@@ -1163,7 +1167,7 @@ def _generate_openapi_spec(
 
 
 @mcp.tool()
-async def export_openapi_spec(domain: str = None, limit: int = None) -> str:
+async def export_openapi_spec(domain: Optional[str] = None, limit: Optional[int] = None) -> str:
     """
     Exports captured API traffic patterns to an OpenAPI v3 JSON specification.
     Args:
@@ -1181,7 +1185,7 @@ async def export_openapi_spec(domain: str = None, limit: int = None) -> str:
 
 
 @mcp.tool()
-async def get_api_patterns(domain: str = None, limit: int = None) -> str:
+async def get_api_patterns(domain: Optional[str] = None, limit: Optional[int] = None) -> str:
     """
     Cluster captured traffic into endpoint patterns.
     Args:
@@ -1265,7 +1269,7 @@ async def get_api_patterns(domain: str = None, limit: int = None) -> str:
 
 
 @mcp.tool()
-async def detect_auth_pattern(flow_ids: str = None) -> str:
+async def detect_auth_pattern(flow_ids: Optional[str] = None) -> str:
     if flow_ids:
         target_ids = [fid.strip() for fid in flow_ids.split(",") if fid.strip()]
         flows = controller.recorder.get_by_ids(target_ids)
