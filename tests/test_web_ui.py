@@ -114,10 +114,24 @@ async def test_proxy_host_non_loopback_refused(controller):
 
 
 @pytest.mark.asyncio
-async def test_web_port_clash_with_proxy_refused(controller):
+@pytest.mark.parametrize(
+    "host, web_host, allow_remote_bind",
+    [
+        ("127.0.0.1", "127.0.0.1", False),
+        ("localhost", "127.0.0.1", False),
+        ("0.0.0.0", "127.0.0.1", True),
+        ("127.0.0.1", "0.0.0.0", True),
+    ],
+)
+async def test_web_port_clash_with_proxy_refused(
+    controller, host, web_host, allow_remote_bind
+):
+    controller.allow_remote_bind = allow_remote_bind
     port = _free_port()
-    result = await server.start_proxy(port=port, web_port=port)
-    assert "can't share" in result
+    result = await server.start_proxy(
+        port=port, host=host, web_port=port, web_host=web_host
+    )
+    assert "can't share port" in result
     assert not controller.running
 
 

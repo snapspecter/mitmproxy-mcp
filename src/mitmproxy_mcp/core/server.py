@@ -144,8 +144,8 @@ class MitmController:
                 "Refusing to bind the web UI to a non-loopback host without "
                 "explicit remote-bind authorization."
             )
-        if web and (host, port) == (web_host, web_port):
-            return f"The proxy and the web UI can't share {host}:{port}."
+        if web and port == web_port:
+            return f"The proxy and the web UI can't share port {port}."
 
         self.port = port
         opts = options.Options(listen_host=host, listen_port=port)
